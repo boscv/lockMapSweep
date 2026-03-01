@@ -45,6 +45,9 @@ lockMapSweep_blocksY 3
 lockMapSweep_cellsPerBlock 2
 lockMapSweep_useStateFile 1
 ```
+<img width="200" height="200" alt="ra_fild12_grid3x3" src="https://github.com/user-attachments/assets/eaca470e-e85f-4090-b76b-8d58f0654b21" />
+
+`ra_fild12 3x3 grid`
 
 ## 📝 Notes
 
