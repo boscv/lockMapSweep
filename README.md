@@ -1,64 +1,54 @@
-# 🗺️ lockMapSweep plugin
+# 🗺️ lockMapSweep
 
-Smart `randomWalk` override for `lockMap` using fixed map blocks.
+**A smarter destination sweep for OpenKore's `randomWalk`.**
 
-## ✅ What it does
+While the character is on the configured `lockMap`, the plugin divides the walkable area into blocks and visits valid destinations in an orderly way.
 
-- Reads `lockMap` field geometry once on plugin initialization (or when `lockMap`/plugin config changes).
-- Divides the map into configurable blocks (`blocksX * blocksY`) using only the bounding rectangle of reachable walkable cells (not total map size), reducing "empty/cut" blocks on irregular maps.
-- For each randomWalk cycle, picks random walkable **reachable** target cells inside the current block.
-- Targets are selected dynamically each cycle (not a prebuilt fixed route list).
-- Visits `N` random cells in the same block (`cellsPerBlock`), then chooses the next block using an adjacency-first strategy (prefer unvisited neighbor blocks; fallback to nearest unvisited block).
-- While inside a block cycle, avoids repeating the same target cell until changing block.
-- For routes **inside the same block**, selected targets are validated so the path can be kept inside that block.
-- For the first route when switching block, target is chosen from a constrained transition search that only uses previous+next blocks (it will not cut through a third block), reducing retries and stalls.
-- Does not fully reprocess the map on map changes.
+## ✨ How it works
 
-## ⚙️ Config keys
+- Uses the walkable area reachable from the character's current position and ignores disconnected islands.
+- Divides that area's bounds into configurable blocks and selects valid destinations in the current block.
+- Respects OpenKore's `lockMap_x`, `lockMap_y`, `lockMap_randX`, and `lockMap_randY` settings. These restrict destinations; other walkable cells may still be used along the route.
+- Avoids repeating destinations during a block's visit quota and prefers adjacent blocks that have not been visited yet.
+- When changing blocks, searches for a destination reachable through the source and destination blocks.
+- Advances progress only after the route ends and the character's position confirms arrival. Interrupted or failed routes do not count as visits.
+- Updates the plan when the map or relevant settings change. If a changed restriction invalidates an active plugin route, that route is cleared and replanned.
 
-### `lockMapSweep_enabled` `0|1`
-Enable plugin (default: disabled).
+## ⚙️ Configuration
 
-### `lockMapSweep_blocksX` `<int>`
-Number of horizontal blocks. Default: `3`
+Add these options to OpenKore's `control/config.txt`:
 
-### `lockMapSweep_blocksY` `<int>`
-Number of vertical blocks. Default: `3`
+| Option | Default | Description |
+| --- | --- | --- |
+| `lockMapSweep_enabled` | `0` | Set to `1` to enable the plugin. |
+| `lockMapSweep_blocksX` | `2` | Number of blocks horizontally. |
+| `lockMapSweep_blocksY` | `2` | Number of blocks vertically. |
+| `lockMapSweep_cellsPerBlock` | `3` | Successful visits before moving on. Blocks with fewer valid destinations use a smaller quota. |
+| `lockMapSweep_useStateFile` | `1` | Save the plan and progress. Set to `0` to disable persistence. |
+| `lockMapSweep_stateDir` | `plugins/lockMapSweep/state` | Directory for state files. |
 
-### `lockMapSweep_cellsPerBlock` `<int>`
-Number of target cells to visit in each block before moving to next one. Default: `2`
+The plugin also respects OpenKore's existing `lockMap` and coordinate restriction settings.
 
-### `lockMapSweep_useStateFile` `0|1`
-Persist block metadata + loop progress to a state file. Default: `1`
+Example: a 3×3 sweep with up to two visits per block.
 
-### `lockMapSweep_stateDir` `<path>`
-Directory used for state files. Default: `plugins/lockMapSweep/state`
-
-## 🧪 Example
-
-#### 📄 config.txt
-```txt
-# 9 blocks (3x3), 2 routes per block
+```text
 lockMapSweep_enabled 1
 lockMapSweep_blocksX 3
 lockMapSweep_blocksY 3
 lockMapSweep_cellsPerBlock 2
 lockMapSweep_useStateFile 1
 ```
-<img width="200" height="200" alt="ra_fild12_grid3x3" src="https://github.com/user-attachments/assets/eaca470e-e85f-4090-b76b-8d58f0654b21" />
 
-`ra_fild12 3x3 grid`
+![3×3 grid on ra_fild12](https://github.com/user-attachments/assets/eaca470e-e85f-4090-b76b-8d58f0654b21)
 
-## 📝 Notes
+*Example grid for `ra_fild12`.*
 
-- Plugin only intercepts randomWalk while character is inside `lockMap`.
-- Block traversal is cycle-based: it tries to cover all non-empty blocks before resetting the cycle, avoiding fixed linear order like `0->1->2->3...`.
-- If `lockMap` is changed while running, plugin rebuilds plan for the new map.
-- Disconnected/unreachable islands (e.g. map-corner artifacts) are ignored by filtering to the main reachable component.
-- If it cannot pick a valid target, default randomWalk behavior is used as fallback.
+## 💾 Saved state
+
+With persistence enabled, the plugin saves progress, used and failed destinations, and the pending route. On startup, it checks the saved state against the current map geometry, block settings, and coordinate restrictions. Older or incompatible files are rebuilt. State writes replace the file atomically so a failed write preserves the previous valid state.
 
 ## ⌨️ Commands
 
-- `lockMapSweep status` — show current runtime state (current block/visit counters).
-- `lockMapSweep rebuild` — force full state rebuild for current `lockMap` (also removes saved state file first).
-- `lockMapSweep clearstate` — remove only the saved state file (next rebuild/restart regenerates it).
+- `lockMapSweep status` — show whether the plan is ready, the current map, block and visit counts, and blocks visited in the current cycle.
+- `lockMapSweep rebuild` — build a fresh plan from the current map and settings. If rebuilding fails, the previous valid state is preserved.
+- `lockMapSweep clearstate` — delete the saved file without changing the in-memory plan. State is created again on the next `rebuild` or restart.
