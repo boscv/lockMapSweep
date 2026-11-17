@@ -7,21 +7,22 @@
 
 ## O que é o lockMapSweep?
 
-O OpenKore consegue movimentar o personagem pelo mapa usando o `randomWalk`, mas escolher destinos aleatórios nem sempre resulta em uma exploração organizada. **O lockMapSweep torna essa movimentação mais sistemática:** divide a parte caminhável do mapa definido em `lockMap` em áreas menores (**blocos**) e seleciona destinos em cada uma antes de seguir para a próxima.
+O OpenKore consegue movimentar o personagem pelo mapa usando o `randomWalk`, mas escolher destinos aleatórios nem sempre resulta em uma exploração organizada. **O lockMapSweep planeja a exploração da área caminhável do `lockMap`:** mantém a grade de áreas menores (**blocos**), identifica regiões conectadas dentro delas e escolhe destinos considerando as quotas de visita restantes no mapa.
 
-É como explorar um bairro por setores, em vez de ficar indo de uma rua aleatória a outra.
+É como manter uma lista geral das áreas que ainda precisam de visitas e aproveitar boas oportunidades conforme as rotas avançam. O plugin continua sendo um planejador de destinos para caminhada aleatória; ele não define uma patrulha fixa.
 
 **Importante:** o lockMapSweep muda **para onde a caminhada aleatória tenta ir**. O OpenKore continua responsável por calcular e executar o caminho. O plugin atua apenas quando está ativado e o personagem está no `lockMap` configurado.
 
 ## Como funciona
 
-1. **Identifica a área acessível.** O plugin encontra as células caminháveis conectadas à posição atual do personagem e ignora regiões isoladas.
-2. **Divide o mapa em blocos.** Essa área é organizada em uma grade com quantidade configurável de blocos horizontais e verticais.
-3. **Escolhe um destino.** O plugin procura um ponto válido no bloco atual, evitando repetições desnecessárias.
-4. **Confirma a chegada.** Uma visita só é contabilizada **depois que a chegada é confirmada**. Rotas canceladas, interrompidas ou travadas não contam.
-5. **Avança para outro bloco.** Após atingir a quantidade de visitas, o plugin prefere um bloco vizinho ainda não visitado. Quando os blocos ativos são percorridos, um novo ciclo pode começar.
+1. **Monta a topologia do mapa.** O plugin encontra as células caminháveis conectadas ao personagem pelas regras de movimento do OpenKore, mantém a grade configurada e identifica regiões internamente desconectadas dentro dos blocos. Regiões sem conexão com a área navegável do personagem não criam obrigações de visita.
+2. **Mantém as quotas da rodada.** `lockMapSweep_cellsPerBlock` é o máximo de visitas confirmadas a destinos de cobertura atribuídas a cada bloco em uma rodada. As visitas a um bloco podem ser separadas por exploração em outros blocos; sair de um bloco não conclui nem reinicia sua quota.
+3. **Escolhe destinos proporcionalmente.** A quantidade de células elegíveis determina a participação de cada região. O histórico de visitas confirmadas ajusta a seleção probabilística ao longo de várias rodadas, permitindo que regiões pequenas ganhem prioridade quando ficam esquecidas, sem garantir uma distribuição fixa em cada rodada.
+4. **Planeja o deslocamento global.** Uma busca limitada considera as quotas restantes, os custos de chegada e saída e as regiões conectadas por blocos vizinhos. Uma obrigação distante pode ser alcançada por pontos de trânsito estratégico. O trânsito não conta como visita, e o plano é reavaliado conforme o personagem se movimenta ou as condições mudam.
+5. **Aproveita oportunidades convenientes.** O histórico pode favorecer uma região próxima ou que faça parte de uma continuação útil. Uma região que exigiria deslocamento adicional excessivo pode ser adiada até surgir uma oportunidade adequada; ela pode continuar pendente indefinidamente, em vez de forçar um desvio.
+6. **Confirma cada visita.** A quota do bloco e o histórico da região avançam somente quando o personagem chega a um destino de cobertura escolhido intencionalmente e a chegada é confirmada. Trânsito, rotas apenas enfileiradas, interrompidas ou malsucedidas não contam visitas.
 
-As transições entre blocos passam por verificações de conectividade. O plugin também reage a mudanças relevantes de mapa ou configuração, em vez de continuar usando um planejamento desatualizado.
+O OpenKore continua calculando e executando cada rota. A topologia e as estimativas de custo do plugin orientam o planejamento dos destinos; elas não garantem que a rota nativa do OpenKore siga o caminho estimado ou tenha sucesso. Mudanças relevantes no mapa e na configuração invalidam ou reconstruem o estado de planejamento afetado.
 
 ## Primeiros passos
 
@@ -57,7 +58,7 @@ Esse exemplo cria uma **grade 3 × 3** e busca realizar **até duas visitas conf
 | `lockMapSweep_enabled` | `0` | Defina `1` para ativar o plugin. |
 | `lockMapSweep_blocksX` | `2` | Quantidade de blocos na horizontal. |
 | `lockMapSweep_blocksY` | `2` | Quantidade de blocos na vertical. |
-| `lockMapSweep_cellsPerBlock` | `3` | Máximo de visitas confirmadas em um bloco antes de trocar. Blocos com menos destinos válidos podem ter uma quota menor. |
+| `lockMapSweep_cellsPerBlock` | `3` | Máximo de visitas confirmadas a destinos de cobertura atribuídas a cada bloco por rodada global. As visitas podem ser não consecutivas. Um bloco com menos destinos elegíveis pode ter uma quota menor. |
 | `lockMapSweep_useStateFile` | `1` | `1` salva o progresso em arquivo; `0` mantém o progresso somente em memória. |
 | `lockMapSweep_stateDir` | `plugins/lockMapSweep/state` | Pasta utilizada para salvar os arquivos de estado. |
 
@@ -65,7 +66,7 @@ Esse exemplo cria uma **grade 3 × 3** e busca realizar **até duas visitas conf
 
 O plugin respeita as configurações existentes `lockMap`, `lockMap_x`, `lockMap_y`, `lockMap_randX` e `lockMap_randY`. Essas coordenadas restringem **os destinos permitidos**, e não todas as células caminháveis por onde o personagem pode passar. Também considera as exclusões de destino registradas por meio do hook `add_dropDestinationCells` do OpenKore.
 
-**Detalhe técnico:** o destino precisa pertencer à região caminhável conectada ao personagem e obedecer às restrições configuradas. Nas mudanças de bloco, a seleção verifica a existência de um caminho pela área dos blocos de origem e destino. Isso reduz falhas evitáveis, mas não garante sucesso em qualquer servidor.
+**Detalhe técnico:** um destino de cobertura precisa estar conectado à área navegável atual do personagem e obedecer às restrições configuradas. Outras células caminháveis podem ser usadas como trânsito, inclusive em blocos cujas quotas já foram concluídas. O planejador usa conectividade pelas regras de movimento e buscas limitadas de custo de rota; o OpenKore executa a rota selecionada de forma independente, e o comportamento do servidor, obstáculos ou falhas podem alterar o deslocamento real.
 
 ## Comandos do console
 
@@ -77,19 +78,21 @@ O plugin respeita as configurações existentes `lockMap`, `lockMap_x`, `lockMap
 
 ## Salvamento de progresso e recuperação de falhas
 
-Com a persistência ativada, o lockMapSweep salva o planejamento, o progresso, os destinos visitados e malsucedidos e qualquer destino pendente. Na inicialização, verifica se esses dados são compatíveis com a geometria do mapa, a grade e as restrições de destino. **Estados antigos ou incompatíveis são reconstruídos**, em vez de reutilizados sem verificação.
+Com a persistência ativada, o lockMapSweep salva as visitas confirmadas de cada bloco na rodada atual, o histórico de longo prazo das regiões, as obrigações adiadas, os destinos visitados e malsucedidos e qualquer destino pendente. Rotas pendentes são reconciliadas após uma reinicialização para evitar contabilizar a mesma chegada duas vezes. Na inicialização, os dados são verificados contra a geometria do mapa, a grade, a quota e as restrições de destino. **Estados incompatíveis são descartados e reconstruídos** para não orientar navegação inválida; mudar essas opções pode iniciar uma nova rodada e uma nova base de histórico regional.
 
 A gravação utiliza um arquivo temporário e substituição atômica para reduzir o risco de arquivos parcialmente gravados.
 
-Se uma alteração relevante de configuração invalidar uma rota iniciada pelo plugin, ela pode ser cancelada e recalculada. Caso não seja possível construir um planejamento válido com as novas opções, o plugin pausa a exploração para não continuar deliberadamente com restrições antigas. Em outras situações, quando existe um plano válido mas nenhum destino é selecionado, o `randomWalk` padrão do OpenKore ainda pode ser utilizado como alternativa.
+Se uma alteração relevante de configuração invalidar uma rota iniciada pelo plugin, ela pode ser cancelada e recalculada. Caso não seja possível construir um planejamento válido com as novas opções, o plugin pausa a exploração para não continuar deliberadamente com restrições antigas. Obrigações conectadas globalmente podem continuar adiadas quando excedem o limite de desvios opcionais; não há garantia de que toda região adiada será atendida rapidamente. Em outras situações, quando existe um plano válido mas nenhum destino é selecionado, o `randomWalk` padrão do OpenKore ainda pode ser utilizado como alternativa.
 
-## O que mudou na versão 2.0.0?
+## Compatibilidade e limites do planejamento
 
-- **Progresso mais preciso:** um destino só conta depois da chegada confirmada, não quando a rota é solicitada.
-- **Melhor recuperação:** rotas interrompidas ou travadas não aumentam indevidamente as visitas; destinos malsucedidos são acompanhados.
-- **Destinos mais seguros:** melhores verificações de conectividade e respeito às restrições de coordenadas e às exclusões de destino.
-- **Atualização em tempo real:** o planejamento reage a mudanças relevantes nas configurações e no mapa.
-- **Salvamento mais confiável:** validação mais rigorosa do estado persistido e substituição segura dos arquivos.
+- O lockMapSweep usa hooks de plugin do OpenKore, as regras de caminhada e movimento de `Field` e a navegação nativa de `randomWalk`. Instale-o em uma versão do OpenKore que ofereça essas interfaces e os dados de campo do mapa configurado.
+- O planejador usa seleção probabilística de regiões e busca limitada. As proporções de cobertura são tendências de longo prazo, não agendas fixas nem garantias para uma única rodada.
+- Desvios opcionais de cobertura são limitados. O trânsito estratégico pode envolver várias rotas nativas, mas as estimativas não garantem o movimento confirmado pelo servidor.
+- Uma região sem conexão global com a área navegável do personagem não é uma obrigação de cobertura. Uma região conectada pode continuar adiada se visitá-la for consistentemente caro.
+- Repetir o trajeto por blocos ou corredores pode ser necessário para um plano eficiente. O trânsito não consome a quota de visitas do bloco, e a rodada não precisa terminar na posição inicial.
+
+O planejamento por regiões não exige novas opções de configuração. As opções acima preservam a grade de blocos, as restrições de destino e os controles de persistência existentes.
 
 ---
 
