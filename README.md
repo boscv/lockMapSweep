@@ -1,6 +1,7 @@
 # 🗺️ lockMapSweep
 
 **Smarter map exploration for [OpenKore](https://github.com/OpenKore/openkore)**
+
 **Version 2.1.0** · **English** | [Português](README.pt-BR.md)
 
 OpenKore's `randomWalk` moves your character, but random destinations do not necessarily spread exploration across a map. **lockMapSweep** organizes destination selection: it divides navigable ground into blocks, recognizes obstacles and connected regions, remembers which areas still need visits, and considers travel costs when choosing where to go next.
@@ -24,6 +25,7 @@ OpenKore's `randomWalk` moves your character, but random destinations do not nec
 4. Launch OpenKore and enter `lockMapSweep status` to inspect the current plan.
 
 
+
 ## Three concepts to know
 
 | Concept | Meaning |
@@ -34,23 +36,21 @@ OpenKore's `randomWalk` moves your character, but random destinations do not nec
 
 A **round** finishes once the applicable block quotas have been met. For example, four blocks with a quota of two visits each call for up to eight confirmed coverage arrivals, subject to the valid destinations available in each block.
 
+**Visits to a block do not have to be consecutive.** If the character leaves before fulfilling that block's quota, confirmed progress is preserved and can be completed after a later return.
+
 **Passing through an area is not automatically a coverage visit.** The character may cross a corridor, an intermediate region, or a finished block simply to reach another destination. That movement is **transit** and does not increment visit counts.
 
 ## Visual examples: from simple to complex maps
 
 These illustrations show possible planner decisions, not guaranteed patrol patterns. Dashed lines explain the idea of movement, not the exact path the game will execute. Numbered points indicate an example sequence, not a mandatory order.
 
-### 1. Open map: cover it block by block
+### 1. Open map: avoid needless crossings
 
-![Simple 2×2 grid with two coverage destinations per block](docs/images/01-simple-block-coverage.svg)
+![Open 2×2 grid with a geographically coherent example of adjacent block visits](docs/images/01-simple-block-coverage.svg)
 
-Imagine an open map divided into **four blocks** with `lockMapSweep_cellsPerBlock 2`.
+With **four blocks** and `lockMapSweep_cellsPerBlock 2`, each block has up to two coverage visits per round. On an open map, one coherent illustrative order is **1 → 2 → 3 → 4 → 8 → 7 → 6 → 5**: after point 4, the character is near the lower-right block and need not cross the entire grid to point 5.
 
-- The plugin picks valid destination cells in the blocks.
-- Each confirmed arrival fulfills one of that block's two required visits.
-- Once the round's quotas are complete, a new exploration round begins.
-
-**Why it helps:** destinations are chosen with awareness of which parts of the map have already received attention. There is still randomness, but also block-level progress.
+The plugin considers travel costs, pending quotas, and regional history, so **this exact order is not guaranteed**. The example shows why adjacent opportunities may make more sense than unnecessary cross-map trips.
 
 ### 2. Fragmented map: two regions inside one block
 
@@ -64,17 +64,17 @@ A wall separates **A** and **B** within the upper block. To move from A to B, th
 
 **Why it helps:** a block boundary does not trick the planner into assuming every part of that block is directly connected. This is how it handles irregular, fragmented maps.
 
-### 3. Interrupted block quotas: leave and return later
+### 3. Costly detours: deferring can be more efficient
 
-![Nonconsecutive coverage arrivals across blocks A, B, D, A, C, B, C, D](docs/images/03-nonconsecutive-block-visits.svg)
+![A nearby coverage destination is selected before another reachable target requiring a long detour](docs/images/03-avoid-costly-detours.svg)
 
-With two visits required per block, the character might visit **A** once, move through **B** and **D**, then return to **A** later.
+Imagine two outstanding coverage destinations: **A** is nearby, while **B** lies behind an obstacle. B remains reachable through a longer corridor, but pursuing it right now would require a substantial detour.
 
-- Leaving A at `1/2` does not reset its progress.
-- The planner still knows A needs one more visit.
-- Finished blocks may be crossed on the way to other destinations without receiving extra visits.
+- The planner considers **travel cost**, not just straight-line distance on the map.
+- It may choose A first and keep B pending, without manufacturing an arrival.
+- B may become an option later when planning conditions are more favorable. **There is no guarantee that every deferred obligation will be serviced quickly or within any particular round.**
 
-**Why it helps:** exploring a map does not require finishing every block before leaving it. The plugin can take useful opportunities while keeping outstanding obligations.
+**Why it helps:** coverage does not become a series of expensive detours solely to follow a rigid order. The drawn paths are illustrative, not a guarantee of the precise native route.
 
 ### 4. Unequal regions: balance opportunities over time
 
@@ -86,33 +86,30 @@ This **does not** prescribe six visits to A, three to B, and one to C out of eve
 
 **Why it helps:** small corners remain part of the planning process rather than disappearing behind much larger areas.
 
-### 5. Failed destination: retry without losing the round
+### 5. Failed destination: continue and retry promptly
 
-![Route failure, a 30-second wait, and a later confirmed retry](docs/images/05-failure-cooldown-retry.svg)
+![A failed route can be followed by another available destination immediately, while repeated retries use a progressive 1–8 second delay](docs/images/05-failure-cooldown-retry.svg)
 
-A canceled, stuck, or failed route **does not** count as a visit. The failed destination is temporarily excluded. If every remaining eligible destination has failed, the plugin pauses retries for **30 seconds**.
+An interrupted or unsuccessful route **does not count as a visit**. A failed destination should not block other available choices.
 
-- When other eligible destinations remain available, the plugin can continue exploring them instead of repeating the failed route.
-- After the cooldown, failed destinations can be reconsidered. The plugin retains outstanding quotas while waiting rather than repeatedly requesting routes.
-- If access remains impossible, the visit stays pending. The planner does not manufacture an arrival to finish the round.
+- **Another usable destination exists:** the planner may choose it at the next opportunity without a global pause.
+- **A failed destination must be retried:** the minimum delay increases through **1s → 2s → 4s → 8s**, capped at eight seconds for consecutive failures. OpenKore's actual scheduling may take longer.
+- **All options are temporarily unavailable:** quotas stay pending; retries are throttled without running expensive searches or routing loops on every AI tick.
+- **A route remains impossible:** failure is never credited as a successful visit.
 
-**Why it helps:** temporary navigation problems need not erase progress or produce endless immediate retry loops.
+Progressive backoff avoids repeated unsuccessful routes without delaying usable alternatives.
 
-### 6. Single destination: move away and come back
+### 6. Strategic transit through an already completed block
 
-![Destination at (20,26), temporary staging at (21,25), and confirmed return](docs/images/06-same-cell-stage-return.svg)
+![Travel from A to a pending destination in C through completed block B, without another visit to B](docs/images/06-transit-through-completed-block.svg)
 
-Imagine a restriction that permits just **one coverage destination**, at `(20,26)`. After a round ends, the character is still standing there. Remaining on the cell **must not** count as a new visit.
+The character has an outstanding coverage destination in **C**, but the available corridor crosses block **B**, whose quota is already complete (`2/2`).
 
-The plugin looks for a nearby walkable staging cell, moves the character there, for example to `(21,25)`, then returns to `(20,26)`:
+- The planner can cross B even though its coverage quota is fulfilled.
+- **Crossing B is transit:** it does not add a third visit to B.
+- A visit is credited only after a confirmed arrival at the selected destination in C.
 
-- **Moving away:** transit, worth **zero visits**.
-- **Confirmed return:** worth **one visit** in the new round.
-- Staging can be outside configured **destination** restrictions because it is not a coverage destination.
-
-The staging search is bounded to **eight route-cost steps**. If no legal staging cell exists, the obligation remains pending, the plugin reports the blockage, and retries are considered after 30 seconds.
-
-**Why it helps:** even a one-cell coverage area cannot generate visits merely because the character is standing still.
+**Why it helps:** completed blocks are not forbidden zones. The character can still use connected corridors to reach outstanding destinations elsewhere.
 
 ## How does it choose the next destination?
 
@@ -137,7 +134,6 @@ The planner **does not follow a fixed block order** or guarantee the globally sh
 | Queuing a route that has not finished | ❌ |
 | An interrupted or failed route | ❌ |
 | Standing still on the only eligible destination | ❌ |
-| Moving away and making a confirmed return | ✅ |
 
 ## Configuration
 
@@ -168,15 +164,13 @@ The plugin is active only while enabled and the character is on the configured `
 
 ## Saved progress and special situations
 
-With `lockMapSweep_useStateFile 1`, the plugin can restore confirmed block visits, regional history, outstanding quotas, failed destinations, and pending routes. When necessary, it also records move-away and return phases.
+With `lockMapSweep_useStateFile 1`, the plugin can restore confirmed block visits, regional history, outstanding quotas, failed destinations, and pending routes. In exceptionally narrow configurations, it can also preserve internal movement-recovery phases.
 
 On startup it checks that the saved state matches the current map and settings. Incompatible or invalid state is rebuilt instead of being trusted. Changes to geometry, the grid, or destination restrictions can therefore restart recorded progress.
 
-## Compatibility
+**Why might the character stop choosing destinations?** Failed routes may be waiting for their retry window, a reachable region may require a detour considered too costly at the moment, or a very restrictive configuration may leave no useful coverage destination. In some situations OpenKore can still use ordinary `randomWalk` as a fallback; during explicitly blocked recovery states the plugin suppresses that fallback to avoid uncontrolled movement.
 
-lockMapSweep uses OpenKore plugin hooks, map field walkability data (`.fld2`), and its native `randomWalk`/`ai_route` interfaces. The OpenKore installation must provide those interfaces and field data for the configured map. The plugin estimates connectivity and travel costs for planning; OpenKore still chooses and executes each native route, so estimated paths do not guarantee the exact movement or a successful arrival.
-
-**Why might the character stop choosing destinations?** Failed routes may be waiting for their retry window, a reachable region may require a detour considered too costly at the moment, or no legal staging cell may exist. In some situations OpenKore can still use ordinary `randomWalk` as a fallback; during explicitly blocked recovery states the plugin suppresses that fallback to avoid uncontrolled movement.
+**Extreme configuration:** if only one destination cell is allowed, the plugin may need to move away and return before crediting another confirmed arrival. That prevents stationary credit, but it is not meaningful exploration of a larger area. For useful coverage, configure an area with multiple walkable destinations.
 
 **What it does not promise:** visiting every cell, distributing exactly equal visits among regions, reaching physically disconnected areas, or completing routes that OpenKore and the game server cannot execute.
 
@@ -188,8 +182,8 @@ lockMapSweep uses OpenKore plugin hooks, map field walkability data (`.fld2`), a
 - Exploration no longer requires finishing a block before moving on: **partial visit quotas remain pending** and may be resumed later.
 - Destination selection now considers **proportional regional history**, travel costs, and **strategic transit** across the map.
 - Saved progress includes the information needed to resume **quotas, regional history, pending routes, and route-failure recovery**.
-- Failed destinations can be reconsidered after **30 seconds**, without counting attempts as visits.
-- When the only eligible destination is already occupied, the next visit requires a **real departure and confirmed return**, not stationary credit.
+- Failed destinations are reconsidered with **progressive 1–8 second retries**, without counting attempts as visits.
+- Prevented stationary visit credit in one-destination configurations; a new arrival must correspond to actual movement.
 
 ### 2.0.0 — Block navigation and confirmed arrivals
 
