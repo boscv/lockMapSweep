@@ -40,7 +40,8 @@ my $cmd_hooks = Commands::register(
 my $MAX_REASONABLE_DETOUR = 24;
 my $GLOBAL_PLAN_TEMPERATURE = $MAX_REASONABLE_DETOUR;
 my $STRATEGIC_WAYPOINT_STEPS = 96;
-my $FAILED_TARGET_RETRY_SECONDS = 30;
+my $FAILED_TARGET_RETRY_INITIAL_SECONDS = 1;
+my $FAILED_TARGET_RETRY_MAX_SECONDS = 8;
 
 my $strategic_search_cache;
 
@@ -82,6 +83,7 @@ my %state = (
 		restriction_signature => '',
 	pending_target => undef,
 	failed_targets_by_block => {},
+	failed_target_retry_by_block => {},
 	failed_retry_after => 0,
 	failed_config_signature => undef,
 );
@@ -384,6 +386,7 @@ sub begin_same_cell_recovery {
 		region_key => $target->{region_key},
 		stage_x => -1, stage_y => -1,
 		retry_after => 0,
+		consecutive_failures => 0,
 	};
 	$state{same_cell_recovery} = $recovery;
 	return staging_target_from_recovery($recovery, $origin);
@@ -393,11 +396,11 @@ sub resume_same_cell_recovery {
 	my ($origin) = @_;
 	my $recovery = $state{same_cell_recovery} or return undef;
 	return undef unless $origin && defined $origin->{x} && defined $origin->{y};
+	return undef if ($recovery->{retry_after} || 0) > time();
 	if ($recovery->{phase} eq 'blocked') {
-		return undef if ($recovery->{retry_after} || 0) > time();
 		$recovery->{phase} = 'stage';
-		$recovery->{retry_after} = 0;
 	}
+	$recovery->{retry_after} = 0;
 	if ($recovery->{phase} eq 'stage') {
 		return staging_target_from_recovery($recovery, $origin);
 	}
@@ -423,7 +426,7 @@ sub staging_target_from_recovery {
 		$recovery->{phase} = 'blocked';
 		$recovery->{stage_x} = -1;
 		$recovery->{stage_y} = -1;
-		$recovery->{retry_after} = int(time()) + $FAILED_TARGET_RETRY_SECONDS;
+		$recovery->{retry_after} = schedule_recovery_retry($recovery);
 		my $idx = $recovery->{block_idx};
 		$state{deferred_blocks}{$idx} = {
 			remaining => remaining_block_visits($idx),
@@ -527,12 +530,14 @@ sub complete_pending_target {
 			}
 			$recovery->{phase} = 'return';
 			$recovery->{retry_after} = 0;
+			$recovery->{consecutive_failures} = 0;
 			delete $state{deferred_blocks}{$recovery->{block_idx}};
 			persist_state();
 			message sprintf("[lockMapSweep] Reached staging position at %d, %d; no coverage visit credited, returning to %d, %d.\n",
 				$pending->{x}, $pending->{y}, $recovery->{x}, $recovery->{y}), 'route';
 			return 1;
 		}
+		clear_failed_target_retry($pending);
 		persist_state();
 		message sprintf("[lockMapSweep] Reached strategic transit waypoint at %d, %d; no block visit credited.\n",
 			$pending->{x}, $pending->{y}), 'route';
@@ -546,6 +551,7 @@ sub complete_pending_target {
 	$state{region_visit_history}{$pending->{region_key}}++ if $pending->{region_key};
 	$state{last_target} = { x => $pending->{x}, y => $pending->{y} };
 	$state{last_block} = $block_idx;
+	clear_failed_target_retry($pending);
 	if (my $recovery = $state{same_cell_recovery}) {
 		$state{same_cell_recovery} = undef
 			if $recovery->{phase} eq 'return'
@@ -567,7 +573,7 @@ sub reject_pending_target {
 	if ($pending->{transit} && pending_is_recovery_stage($pending)) {
 		my $recovery = $state{same_cell_recovery};
 		$recovery->{phase} = 'blocked';
-		$recovery->{retry_after} = int(time()) + $FAILED_TARGET_RETRY_SECONDS;
+		$recovery->{retry_after} = schedule_recovery_retry($recovery);
 		my $idx = $recovery->{block_idx};
 		$state{deferred_blocks}{$idx} = {
 			remaining => remaining_block_visits($idx),
@@ -579,16 +585,80 @@ sub reject_pending_target {
 			$pending->{x}, $pending->{y}, $reason || 'unknown route failure', $recovery->{retry_after}), 'route';
 		return 1;
 	}
-	my $block = $state{bounds}->[$pending->{block_idx}];
-	my $key = $block ? block_key($block) : $pending->{block_idx};
-	$state{failed_targets_by_block}{$key} ||= {};
-	$state{failed_targets_by_block}{$key}{"$pending->{x},$pending->{y}"} = 1;
-	$state{failed_retry_after} = int(time()) + $FAILED_TARGET_RETRY_SECONDS;
+	my $retry_after = record_failed_target($pending);
+	if ($state{same_cell_recovery}
+		&& $state{same_cell_recovery}{phase} eq 'return'
+		&& $pending->{block_idx} == $state{same_cell_recovery}{block_idx}
+		&& $pending->{x} == $state{same_cell_recovery}{x}
+		&& $pending->{y} == $state{same_cell_recovery}{y}) {
+		$state{same_cell_recovery}{consecutive_failures} =
+			$state{failed_target_retry_by_block}{block_key($state{bounds}[$pending->{block_idx}])}{"$pending->{x},$pending->{y}"}{consecutive_failures};
+		$state{same_cell_recovery}{retry_after} = $retry_after;
+	}
 	$strategic_search_cache = undef;
 	persist_state() if $state{ready};
-	warning sprintf("[lockMapSweep] Route to %d, %d did not complete (%s); progress was not advanced.\n",
-		$pending->{x}, $pending->{y}, $reason || 'unknown route failure'), 'route';
+	warning sprintf("[lockMapSweep] Route to %d, %d did not complete (%s); no visit was credited and retry is eligible after %d.\n",
+		$pending->{x}, $pending->{y}, $reason || 'unknown route failure', $retry_after), 'route';
 	return 1;
+}
+
+sub retry_delay_for_failures {
+	my ($failures) = @_;
+	$failures = 1 unless defined $failures && $failures > 0;
+	my $delay = $FAILED_TARGET_RETRY_INITIAL_SECONDS;
+	while ($failures > 1 && $delay < $FAILED_TARGET_RETRY_MAX_SECONDS) {
+		$delay *= 2;
+		$failures--;
+	}
+	return $delay > $FAILED_TARGET_RETRY_MAX_SECONDS
+		? $FAILED_TARGET_RETRY_MAX_SECONDS : $delay;
+}
+
+sub retry_deadline_after {
+	my ($delay) = @_;
+	my $deadline = time() + $delay;
+	my $whole = int($deadline);
+	return $whole < $deadline ? $whole + 1 : $whole;
+}
+
+sub record_failed_target {
+	my ($pending) = @_;
+	my $block = $state{bounds}->[$pending->{block_idx}];
+	my $key = $block ? block_key($block) : $pending->{block_idx};
+	my $coord = "$pending->{x},$pending->{y}";
+	$state{failed_targets_by_block}{$key} ||= {};
+	$state{failed_target_retry_by_block}{$key} ||= {};
+	my $entry = $state{failed_target_retry_by_block}{$key}{$coord} || {};
+	my $failures = ($entry->{consecutive_failures} || 0) + 1;
+	$failures = 1_000_000 if $failures > 1_000_000;
+	my $retry_after = retry_deadline_after(retry_delay_for_failures($failures));
+	$state{failed_targets_by_block}{$key}{$coord} = 1;
+	$state{failed_target_retry_by_block}{$key}{$coord} = {
+		consecutive_failures => $failures,
+		retry_after => $retry_after,
+		transit => $pending->{transit} ? 1 : 0,
+	};
+	return $retry_after;
+}
+
+sub schedule_recovery_retry {
+	my ($recovery) = @_;
+	my $failures = ($recovery->{consecutive_failures} || 0) + 1;
+	$failures = 1_000_000 if $failures > 1_000_000;
+	$recovery->{consecutive_failures} = $failures;
+	return $recovery->{retry_after} = retry_deadline_after(retry_delay_for_failures($failures));
+}
+
+sub clear_failed_target_retry {
+	my ($pending) = @_;
+	return unless $pending;
+	my $block = $state{bounds}->[$pending->{block_idx}];
+	my $key = $block ? block_key($block) : $pending->{block_idx};
+	my $coord = "$pending->{x},$pending->{y}";
+	delete $state{failed_targets_by_block}{$key}{$coord}
+		if $state{failed_targets_by_block}{$key};
+	delete $state{failed_target_retry_by_block}{$key}{$coord}
+		if $state{failed_target_retry_by_block}{$key};
 }
 
 sub is_enabled {
@@ -643,6 +713,7 @@ sub initialize_or_reload {
 		restriction_signature => '',
 		pending_target => undef,
 		failed_targets_by_block => {},
+		failed_target_retry_by_block => {},
 		failed_retry_after => 0,
 		failed_config_signature => undef,
 		);
@@ -1321,6 +1392,15 @@ sub is_cell_eligible {
 	return vec($state{destination_bitmap}, $y * $state{width} + $x, 1) ? 1 : 0;
 }
 
+sub valid_failed_retry_cell {
+	my ($x, $y, $block, $transit) = @_;
+	return 0 unless defined $x && defined $y && $block;
+	return 0 unless within_block({ x => $x, y => $y }, $block);
+	return is_cell_eligible($x, $y) unless $transit;
+	return 0 unless $field && $field->isWalkable($x, $y);
+	return defined region_id_at($x, $y) ? 1 : 0;
+}
+
 sub pick_target_in_current_plan {
 	return undef unless $state{block_count} && $char && $field;
 	my $from = $char->{pos_to} || $char->{pos};
@@ -1689,6 +1769,7 @@ sub refresh_deferred_blocks {
 
 sub pending_target_availability {
 	my ($unused, $failed) = (0, 0);
+	my $now = time();
 	for my $region (@{$state{regions}}) {
 		my $block_idx = $region->{block_idx};
 		next unless remaining_block_visits($block_idx) > 0;
@@ -1700,41 +1781,52 @@ sub pending_target_availability {
 			my ($x, $y) = unpack_region_target($packed);
 			my $cell = "$x,$y";
 			next if $used->{$cell};
-			if ($blocked->{$cell}) { $failed++; }
-			else { $unused++; }
+			my $retry = $state{failed_target_retry_by_block}{$key}{$cell};
+			if (exists $blocked->{$cell} && $retry && $retry->{retry_after} > $now) {
+				$failed++;
+			} else {
+				$unused++;
+			}
 		}
 	}
 	return ($unused, $failed);
 }
 
 sub failure_retry_wait_active {
-	my $retry_after = $state{failed_retry_after} || 0;
-	return 0 unless $retry_after > time();
 	my ($unused, $failed) = pending_target_availability();
-	return $failed > 0 && $unused == 0 ? 1 : 0;
+	return 0 if $unused;
+	return 0 unless $failed;
+	my $retry_after = earliest_pending_retry_after();
+	return defined $retry_after && $retry_after > time() ? 1 : 0;
 }
 
 sub release_failed_targets_if_due {
-	my $retry_after = $state{failed_retry_after} || 0;
-	return 0 if $retry_after > time();
-	my $has_failed = 0;
-	for my $targets (values %{$state{failed_targets_by_block} || {}}) {
-		if (ref($targets) eq 'HASH' && keys %$targets) { $has_failed = 1; last; }
+	my $now = time();
+	my $released = 0;
+	for my $key (keys %{$state{failed_targets_by_block} || {}}) {
+		my $targets = $state{failed_targets_by_block}{$key} || {};
+		for my $coord (keys %$targets) {
+			my $retry = $state{failed_target_retry_by_block}{$key}{$coord};
+			if (!$retry || $retry->{retry_after} <= $now) {
+				delete $targets->{$coord};
+				$released++;
+			}
+		}
+		delete $state{failed_targets_by_block}{$key} unless keys %$targets;
 	}
-	return 0 unless $has_failed;
-	$state{failed_targets_by_block} = {};
+	return 0 unless $released;
 	$state{failed_retry_after} = 0;
+	$strategic_search_cache = undef;
 	for my $idx (keys %{$state{deferred_blocks}}) {
 		delete $state{deferred_blocks}{$idx}
 			if ($state{deferred_blocks}{$idx}{reason} || '') =~ /all remaining destinations failed/;
 	}
-	message "[lockMapSweep] Failed destinations are eligible for a controlled retry; coverage quotas remain pending.\n", 'route';
+	message sprintf("[lockMapSweep] %d failed destination(s) are eligible for a controlled retry; coverage quotas remain pending.\n", $released), 'route';
 	return 1;
 }
 
 sub diagnose_failed_target_exhaustion {
-	my $retry_after = $state{failed_retry_after} || (int(time()) + $FAILED_TARGET_RETRY_SECONDS);
-	$state{failed_retry_after} = $retry_after;
+	my $retry_after = earliest_pending_retry_after() || retry_deadline_after($FAILED_TARGET_RETRY_INITIAL_SECONDS);
 	my $reason = "all remaining destinations failed; coverage is blocked until retry at $retry_after";
 	my $changed = 0;
 	for my $idx (0 .. $#{$state{bounds}}) {
@@ -1753,6 +1845,27 @@ sub diagnose_failed_target_exhaustion {
 	warning "[lockMapSweep] Coverage blocked: every unused destination has a failed route; quotas are retained and retry is scheduled after $retry_after.\n", 'route'
 		if $changed;
 	persist_state() if $changed && $state{ready};
+}
+
+sub earliest_pending_retry_after {
+	my $earliest;
+	for my $region (@{$state{regions} || []}) {
+		my $idx = $region->{block_idx};
+		next unless remaining_block_visits($idx) > 0;
+		my $block = $state{bounds}[$idx] or next;
+		my $key = block_key($block);
+		my $used = $state{used_targets_by_block}{$key} || {};
+		for my $packed (@{$region->{target_cells} || []}) {
+			my ($x, $y) = unpack_region_target($packed);
+			my $coord = "$x,$y";
+			next if $used->{$coord};
+			next unless exists $state{failed_targets_by_block}{$key}{$coord};
+			my $retry = $state{failed_target_retry_by_block}{$key}{$coord} or next;
+			$earliest = $retry->{retry_after}
+				if !defined $earliest || $retry->{retry_after} < $earliest;
+		}
+	}
+	return $earliest;
 }
 
 sub block_visit_quota {
@@ -1784,6 +1897,7 @@ sub start_new_coverage_round {
 	$state{visited_blocks_in_cycle} = {};
 	$state{used_targets_by_block} = {};
 	$state{failed_targets_by_block} = {};
+	$state{failed_target_retry_by_block} = {};
 	$state{deferred_blocks} = {};
 	$state{last_block} = undef;
 }
@@ -2549,13 +2663,17 @@ sub load_state_from_file {
 	my @lines = <$fh>;
 	close $fh;
 
-	my (%meta, %bounds, %visited_blocks, %used_targets, %failed_targets,
-		%round_visits, %region_visits, %deferred, $pending, $recovery);
+	my (%meta, %bounds, %visited_blocks, %used_targets, %failed_targets, %failed_target_retry,
+		%round_visits, %region_visits, %deferred, $pending, $recovery, $retry_metadata_invalid);
 	for my $line (@lines) {
 		chomp $line;
 		next if $line =~ /^\s*$/;
 		if ($line =~ /^meta\t([^\t]+)\t(.*)$/) {
-			return 0 if exists $meta{$1};
+			if (exists $meta{$1}) {
+				return 0 unless $1 eq 'failed_retry_after';
+				$retry_metadata_invalid = 1;
+				next;
+			}
 			$meta{$1} = $2;
 		} elsif ($line =~ /^block\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)$/) {
 			return 0 if exists $bounds{$1};
@@ -2572,19 +2690,33 @@ sub load_state_from_file {
 		} elsif ($line =~ /^deferred\t(\d+)\t(\d+)\t(\d+)\t([^\t]*)$/) {
 			return 0 if exists $deferred{$1};
 			$deferred{$1} = { remaining => int($2), round => int($3), reason => $4 };
-		} elsif ($line =~ /^recovery\t(stage|return|blocked)\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)\t(-?\d+)\t(-?\d+)\t(\d+)$/) {
+		} elsif ($line =~ /^recovery\t(stage|return|blocked)\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)\t(-?\d+)\t(-?\d+)\t(\d+)(?:\t(\d+))?$/) {
 			return 0 if $recovery;
+			my $recovery_failures = defined $10 ? int($10) : ($8 ? 1 : 0);
+			return 0 if $recovery_failures > 1_000_000;
 			$recovery = {
 				phase => $1, block_idx => int($2), x => int($3), y => int($4),
 				region_key => $5, stage_x => int($6), stage_y => int($7),
-				retry_after => int($8),
+				retry_after => int($8), consecutive_failures => $recovery_failures,
 			};
 		} elsif ($line =~ /^target\t(\d+)\t(\d+)\t(\d+)$/) {
 			my ($idx, $x, $y) = ($1, $2, $3);
 			return 0 if $used_targets{$idx}{"$x,$y"}++;
 		} elsif ($line =~ /^failed\t(\d+)\t(\d+)\t(\d+)$/) {
 			my ($idx, $x, $y) = ($1, $2, $3);
-			return 0 if $failed_targets{$idx}{"$x,$y"}++;
+			$retry_metadata_invalid = 1 if $failed_targets{$idx}{"$x,$y"}++;
+		} elsif ($line =~ /^failed_retry\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d{1,11})\t([01])$/) {
+			my ($idx, $x, $y, $failures, $retry_after, $transit) = map { int($_) } ($1, $2, $3, $4, $5, $6);
+			if ($failures < 1 || $failures > 1_000_000 || $retry_after > 4_102_444_800
+				|| exists $failed_target_retry{$idx}{"$x,$y"}) {
+				$retry_metadata_invalid = 1;
+			} else {
+				$failed_target_retry{$idx}{"$x,$y"} = {
+					consecutive_failures => $failures, retry_after => $retry_after, transit => $transit,
+				};
+			}
+		} elsif ($line =~ /^(?:failed|failed_retry)\t/) {
+			$retry_metadata_invalid = 1;
 		} elsif ($line =~ /^pending\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)(?:\t([01]))?$/) {
 			return 0 if $pending;
 			$pending = { block_idx => int($1), x => int($2), y => int($3),
@@ -2595,9 +2727,40 @@ sub load_state_from_file {
 	}
 
 	return 0 unless $meta{version} && $meta{version} =~ /^(?:5|6)$/;
-	return 0 if defined $meta{failed_retry_after}
-		&& ($meta{failed_retry_after} !~ /^\d{1,11}$/ || $meta{failed_retry_after} > 4_102_444_800);
-	return 0 if ($meta{failed_retry_after} || 0) && !keys %failed_targets;
+	my $legacy_deadline = 0;
+	if (defined $meta{failed_retry_after}) {
+		if ($meta{failed_retry_after} !~ /^\d{1,11}$/
+			|| $meta{failed_retry_after} > 4_102_444_800) {
+			$retry_metadata_invalid = 1;
+		} else {
+			$legacy_deadline = int($meta{failed_retry_after});
+		}
+	}
+	$retry_metadata_invalid = 1 if $legacy_deadline && !keys %failed_targets;
+	$retry_metadata_invalid = 1 if $meta{version} eq '5' && keys %failed_target_retry;
+	if (!keys %failed_target_retry && !$retry_metadata_invalid) {
+		# Older v6 state had a single global deadline. Migrate it to each failed
+		# destination independently; state without a deadline becomes eligible now.
+		for my $idx (keys %failed_targets) {
+			for my $coord (keys %{$failed_targets{$idx}}) {
+				$failed_target_retry{$idx}{$coord} = {
+					consecutive_failures => 1, retry_after => $legacy_deadline, transit => 0,
+				};
+			}
+		}
+	} elsif (!$retry_metadata_invalid) {
+		$retry_metadata_invalid = 1 if $legacy_deadline;
+		for my $idx (keys %failed_targets) {
+			for my $coord (keys %{$failed_targets{$idx}}) {
+				$retry_metadata_invalid = 1 unless exists $failed_target_retry{$idx}{$coord};
+			}
+		}
+	}
+	if ($retry_metadata_invalid) {
+		%failed_targets = ();
+		%failed_target_retry = ();
+		$legacy_deadline = 0;
+	}
 	return 0 if $meta{version} eq '5' && $pending && $pending->{transit};
 	return 0 if $meta{version} eq '5' && $recovery;
 	return 0 unless $meta{map} && $meta{map} eq $state{last_lock_map};
@@ -2670,15 +2833,45 @@ sub load_state_from_file {
 			return 0 unless within_block({ x => $x, y => $y }, $block) && is_cell_eligible($x, $y);
 		}
 	}
+	my $retry_cells_valid = 1;
 	for my $idx (keys %failed_targets) {
-		return 0 if $idx >= $state{block_count};
+		if ($idx >= $state{block_count}) { $retry_cells_valid = 0; last; }
 		my $block = $restored_bounds[$idx];
 		for my $coord (keys %{$failed_targets{$idx}}) {
 			my ($x, $y) = split /,/, $coord;
-			return 0 unless within_block({ x => $x, y => $y }, $block) && is_cell_eligible($x, $y);
+			my $retry = $failed_target_retry{$idx}{$coord};
+			unless ($retry && valid_failed_retry_cell($x, $y, $block, $retry->{transit})) {
+				$retry_cells_valid = 0;
+				last;
+			}
 		}
+		last unless $retry_cells_valid;
+	}
+	for my $idx (keys %failed_target_retry) {
+		if ($idx >= $state{block_count}) { $retry_cells_valid = 0; last; }
+		my $block = $restored_bounds[$idx];
+		for my $coord (keys %{$failed_target_retry{$idx}}) {
+			my ($x, $y) = split /,/, $coord;
+			my $retry = $failed_target_retry{$idx}{$coord};
+			unless (valid_failed_retry_cell($x, $y, $block, $retry->{transit})
+				&& ($retry->{retry_after} <= time()
+					|| exists $failed_targets{$idx}{$coord})) {
+				$retry_cells_valid = 0;
+				last;
+			}
+		}
+		last unless $retry_cells_valid;
+	}
+	unless ($retry_cells_valid) {
+		%failed_targets = ();
+		%failed_target_retry = ();
+		$retry_metadata_invalid = 1;
 	}
 	if ($recovery) {
+		if ($retry_metadata_invalid && $recovery->{phase} eq 'return') {
+			$recovery->{retry_after} = 0;
+			$recovery->{consecutive_failures} = 0;
+		}
 		return 0 if $recovery->{block_idx} >= $state{block_count};
 		my $target_block = $restored_bounds[$recovery->{block_idx}];
 		return 0 unless within_block({ x => $recovery->{x}, y => $recovery->{y} }, $target_block)
@@ -2708,7 +2901,7 @@ sub load_state_from_file {
 					&& defined region_id_at($recovery->{stage_x}, $recovery->{stage_y});
 			}
 		} else {
-			return 0 unless $recovery->{retry_after} == 0;
+			return 0 if $recovery->{phase} eq 'stage' && $recovery->{retry_after} != 0;
 			return 0 if $recovery->{stage_x} < 0 || $recovery->{stage_y} < 0
 				|| $recovery->{stage_x} >= $state{width} || $recovery->{stage_y} >= $state{height};
 			return 0 if $recovery->{stage_x} == $recovery->{x}
@@ -2733,6 +2926,13 @@ sub load_state_from_file {
 					return 0 unless $stage_block_idx == $meta{current_block};
 				}
 			} else {
+				return 0 if $pending && $recovery->{retry_after} > 0;
+				if ($recovery->{retry_after} > 0) {
+					my $retry = $failed_target_retry{$recovery->{block_idx}}{"$recovery->{x},$recovery->{y}"}
+						or return 0;
+					return 0 unless $retry->{retry_after} == $recovery->{retry_after}
+						&& $retry->{consecutive_failures} == $recovery->{consecutive_failures};
+				}
 				return 0 if $pending && ($pending->{transit}
 					|| $pending->{x} != $recovery->{x} || $pending->{y} != $recovery->{y}
 					|| $pending->{block_idx} != $recovery->{block_idx}
@@ -2771,17 +2971,21 @@ sub load_state_from_file {
 	$state{walk_max_y} = int($meta{walk_max_y});
 	$state{visited_blocks_in_cycle} = \%visited_blocks;
 	$state{round_number} = int($meta{round_number});
-	$state{failed_retry_after} = int($meta{failed_retry_after} || 0);
+	$state{failed_retry_after} = 0; # legacy metadata is migrated into per-target entries below
 	$state{region_visit_history} = \%region_visits;
 	$state{deferred_blocks} = \%deferred;
 	$state{same_cell_recovery} = $recovery;
 	$state{used_targets_by_block} = {};
 	$state{failed_targets_by_block} = {};
+	$state{failed_target_retry_by_block} = {};
 	for my $idx (keys %used_targets) {
 		$state{used_targets_by_block}{block_key($restored_bounds[$idx])} = $used_targets{$idx};
 	}
 	for my $idx (keys %failed_targets) {
 		$state{failed_targets_by_block}{block_key($restored_bounds[$idx])} = $failed_targets{$idx};
+	}
+	for my $idx (keys %failed_target_retry) {
+		$state{failed_target_retry_by_block}{block_key($restored_bounds[$idx])} = $failed_target_retry{$idx};
 	}
 	$state{pending_target} = $pending;
 
@@ -2821,7 +3025,8 @@ sub persist_state {
 		print {$fh} "meta\tgeometry\t$state{geometry_signature}\n";
 		print {$fh} "meta\tcurrent_block\t$state{current_block}\n";
 		print {$fh} "meta\tvisits_in_block\t$state{visits_in_block}\n";
-		print {$fh} "meta\tfailed_retry_after\t" . ($state{failed_retry_after} || 0) . "\n";
+		# Kept at zero for backward compatibility; current retry state is per target.
+		print {$fh} "meta\tfailed_retry_after\t0\n";
 		print {$fh} "meta\tround_number\t$state{round_number}\n";
 		print {$fh} "meta\twalk_min_x\t$state{walk_min_x}\n";
 		print {$fh} "meta\twalk_max_x\t$state{walk_max_x}\n";
@@ -2836,6 +3041,12 @@ sub persist_state {
 			for my $coord (sort keys %{$state{failed_targets_by_block}{$key} || {}}) {
 				my ($x, $y) = split /,/, $coord;
 				print {$fh} "failed\t$idx\t$x\t$y\n";
+			}
+			for my $coord (sort keys %{$state{failed_target_retry_by_block}{$key} || {}}) {
+				my ($x, $y) = split /,/, $coord;
+				my $retry = $state{failed_target_retry_by_block}{$key}{$coord};
+				print {$fh} join("\t", 'failed_retry', $idx, $x, $y,
+					$retry->{consecutive_failures}, $retry->{retry_after}, $retry->{transit} ? 1 : 0) . "\n";
 			}
 		}
 		for my $idx (sort { $a <=> $b } keys %{$state{block_visit_counts}}) {
@@ -2853,7 +3064,8 @@ sub persist_state {
 		if (my $recovery = $state{same_cell_recovery}) {
 			print {$fh} join("\t", 'recovery', $recovery->{phase}, $recovery->{block_idx},
 				$recovery->{x}, $recovery->{y}, $recovery->{region_key},
-				$recovery->{stage_x}, $recovery->{stage_y}, $recovery->{retry_after} || 0) . "\n";
+				$recovery->{stage_x}, $recovery->{stage_y}, $recovery->{retry_after} || 0,
+				$recovery->{consecutive_failures} || 0) . "\n";
 		}
 		if (my $pending = $state{pending_target}) {
 			my $transit_flag = $pending->{transit} ? "\t1" : '';
