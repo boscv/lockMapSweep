@@ -393,9 +393,33 @@ tick();
 is($route_attempts, $routes_during_return_cooldown, 'return failure observes the existing bounded retry cooldown');
 expire_saved_retry($single_state);
 ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
-	'expired return cooldown restores normal recovery');
+	'expired first return cooldown restores normal recovery');
 tick();
 is_deeply($route_target, { x => 2, y => 1 }, 'recovery retries the original destination after cooldown');
+route_failure();
+my $return_failed_twice = read_state($single_state);
+is($return_failed_twice->{recovery}{consecutive_failures}, 2,
+	'second failed return persists its consecutive failure count');
+is($return_failed_twice->{round_visit}{0} || 0, 0,
+	'second failed return still receives no block visit credit');
+my $history_after_two_return_failures = 0;
+$history_after_two_return_failures += $_ for values %{$return_failed_twice->{region_visit}};
+is($history_after_two_return_failures, 1,
+	'second failed return preserves prior confirmed region history only');
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'restart during second return cooldown accepts the persisted recovery state');
+is(read_state($single_state)->{recovery}{consecutive_failures}, 2,
+	'recovery failure count round-trips through the v6 loader');
+$routes_during_return_cooldown = $route_attempts;
+tick();
+is($route_attempts, $routes_during_return_cooldown,
+	'restored second return cooldown suppresses premature retry');
+expire_saved_retry($single_state);
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'expired second return cooldown remains loadable');
+tick();
+is_deeply($route_target, { x => 2, y => 1 },
+	'recovery retries original destination after second cooldown');
 route_success();
 my $returned = read_state($single_state);
 is($returned->{meta}{round_number}, 3, 'one confirmed departure and return completes exactly one quota');

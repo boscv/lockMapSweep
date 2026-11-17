@@ -2692,7 +2692,7 @@ sub load_state_from_file {
 			$deferred{$1} = { remaining => int($2), round => int($3), reason => $4 };
 		} elsif ($line =~ /^recovery\t(stage|return|blocked)\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)\t(-?\d+)\t(-?\d+)\t(\d+)(?:\t(\d+))?$/) {
 			return 0 if $recovery;
-			my $recovery_failures = defined $10 ? int($10) : ($8 ? 1 : 0);
+			my $recovery_failures = defined $9 ? int($9) : ($8 ? 1 : 0);
 			return 0 if $recovery_failures > 1_000_000;
 			$recovery = {
 				phase => $1, block_idx => int($2), x => int($3), y => int($4),
