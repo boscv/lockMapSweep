@@ -258,6 +258,16 @@ sub on_ai_process_random_walk {
 		from_y => $target->{from_y},
 		transit => $target->{transit} ? 1 : 0,
 	};
+	# A strategic coverage goal can already be the settled character position
+	# (for example, the only eligible cell at the start of a new round). It is
+	# an intentional coverage destination, not a transit waypoint, so settle it
+	# from the authoritative position instead of queuing a zero-length route.
+	if (!$target->{transit} && $origin
+		&& same_position({ x => $target->{x}, y => $target->{y} }, $origin)) {
+		complete_pending_target() if character_at_pending_target();
+		$args->{return} = 1;
+		return;
+	}
 	if ($target->{transit}) {
 		message sprintf("[lockMapSweep] Calculating strategic transit route to block %d: %d, %d toward region %s (goal cost %d, waypoint %d).\n",
 			$target->{block_idx} + 1, $target->{x}, $target->{y},
@@ -1340,6 +1350,22 @@ sub select_strategic_transit_target {
 			length(${$cache->{costs}}), length(${$cache->{previous}})), 'plugin', 2;
 	}
 	my ($costs, $previous) = @{$cache}{qw(costs previous)};
+	my $has_reachable_alternative = 0;
+	REGION: for my $region (@pending_regions) {
+		my $block = $state{bounds}[$region->{block_idx}] or next;
+		my $key = block_key($block);
+		for my $target (@{$region->{target_cells} || []}) {
+			my ($target_x, $target_y) = unpack_region_target($target);
+			my $cell_key = "$target_x,$target_y";
+			next if $state{used_targets_by_block}{$key}{$cell_key}
+				|| $state{failed_targets_by_block}{$key}{$cell_key}
+				|| same_position({ x => $target_x, y => $target_y }, $from);
+			if (defined route_cost_at($costs, $target_x, $target_y)) {
+				$has_reachable_alternative = 1;
+				last REGION;
+			}
+		}
+	}
 	my @global_candidates;
 	my %probability_by_region;
 	my %target_sets;
@@ -1351,6 +1377,8 @@ sub select_strategic_transit_target {
 		for my $target (@{$region->{target_cells} || []}) {
 			my ($target_x, $target_y) = unpack_region_target($target);
 			my $cell_key = "$target_x,$target_y";
+			next if $has_reachable_alternative
+				&& same_position({ x => $target_x, y => $target_y }, $from);
 			next if $state{used_targets_by_block}{$key}{$cell_key}
 				|| $state{failed_targets_by_block}{$key}{$cell_key};
 			my $cost = route_cost_at($costs, $target_x, $target_y);
@@ -1396,6 +1424,13 @@ sub select_strategic_transit_target {
 	unless ($goal) {
 		message "[lockMapSweep] Planning diagnosis: global lookahead returned no first region.\n", 'route';
 		return undef;
+	}
+	if (same_position({ x => $goal->{x}, y => $goal->{y} }, $from)) {
+		return {
+			block_idx => $goal->{block_idx}, region_key => $goal->{region_key},
+			x => $goal->{x}, y => $goal->{y},
+			from_x => $from->{x}, from_y => $from->{y}, transit => 0,
+		};
 	}
 	my $path = reconstruct_cell_path($origin_key, "$goal->{x},$goal->{y}", $previous);
 	unless (ref($path) eq 'ARRAY' && @$path > 1 && @$path == $goal->{arrival_cost} + 1) {

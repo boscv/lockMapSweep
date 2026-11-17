@@ -244,9 +244,23 @@ is($single_complete->{meta}{round_number}, 2, 'one confirmed retry completes the
 ok(!keys %{$single_complete->{round_visit}}, 'new round starts with reset block counters');
 is(0 + (values %{$single_complete->{region_visit}})[0], 1, 'exactly one confirmed region visit is retained');
 is(scalar @{$single_complete->{failed}}, 0, 'round transition clears obsolete failed-target marks');
+
+# A new round may select the sole eligible destination while the character is
+# already standing on it. Treat the settled position as the selected coverage
+# arrival instead of asking OpenKore to construct an unusable zero-length route.
+$movement_settled = 1;
+my $routes_before_same_cell = $route_attempts;
+tick();
+my $same_cell_complete = read_state($single_state);
+is($same_cell_complete->{meta}{round_number}, 3, 'already occupied target fulfills the next round obligation');
+is(0 + (values %{$same_cell_complete->{region_visit}})[0], 2, 'same-cell coverage selection adds exactly one region visit');
+is($route_attempts, $routes_before_same_cell, 'settled same-cell target does not queue a zero-length route');
+is(scalar @{$same_cell_complete->{pending}}, 0, 'same-cell completion leaves no duplicate pending destination');
+$movement_settled = 0;
+
 strip_retry_meta($single_state);
 ok(lockMapSweep::initialize_or_reload(undef, { x => 1, y => 1 }), 'existing v6 state without retry metadata remains loadable');
-is(read_state($single_state)->{meta}{round_number}, 2, 'backward-compatible load preserves its completed round history');
+is(read_state($single_state)->{meta}{round_number}, 3, 'backward-compatible load preserves its completed round history');
 rewrite_retry_meta($single_state, 'not-an-epoch');
 ok(lockMapSweep::initialize_or_reload(undef, { x => 1, y => 1 }), 'malformed retry metadata is rejected by strict state validation');
 my $invalid_retry = read_state($single_state);
