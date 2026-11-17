@@ -46,7 +46,7 @@ These illustrations show possible planner decisions, not guaranteed patrol patte
 
 ### 1. Open map: avoid needless crossings
 
-![Open 2×2 grid with a geographically coherent example of adjacent block visits](docs/images/01-simple-block-coverage.svg)
+![Open 2×2 grid with a geographically coherent example of adjacent block visits](docs/images/01-simple-block-coverage.png)
 
 With **four blocks** and `lockMapSweep_cellsPerBlock 2`, each block has up to two coverage visits per round. On an open map, one coherent illustrative order is **1 → 2 → 3 → 4 → 8 → 7 → 6 → 5**: after point 4, the character is near the lower-right block and need not cross the entire grid to point 5.
 
@@ -54,7 +54,7 @@ The plugin considers travel costs, pending quotas, and regional history, so **th
 
 ### 2. Fragmented map: two regions inside one block
 
-![Two regions separated by a wall within the same block, connected through a lower block](docs/images/02-fragmented-connected-regions.svg)
+![Two regions separated by a wall within the same block, connected through a lower block](docs/images/02-fragmented-connected-regions.png)
 
 A wall separates **A** and **B** within the upper block. To move from A to B, the character must first travel through **C** in the lower block and approach from the other side.
 
@@ -66,7 +66,7 @@ A wall separates **A** and **B** within the upper block. To move from A to B, th
 
 ### 3. Costly detours: deferring can be more efficient
 
-![A nearby coverage destination is selected before another reachable target requiring a long detour](docs/images/03-avoid-costly-detours.svg)
+![A nearby coverage destination is selected before another reachable target requiring a long detour](docs/images/03-avoid-costly-detours.png)
 
 Imagine two outstanding coverage destinations: **A** is nearby, while **B** lies behind an obstacle. B remains reachable through a longer corridor, but pursuing it right now would require a substantial detour.
 
@@ -78,7 +78,7 @@ Imagine two outstanding coverage destinations: **A** is nearby, while **B** lies
 
 ### 4. Unequal regions: balance opportunities over time
 
-![Illustrative regions with 60%, 30%, and 10% of eligible destination cells](docs/images/04-proportional-regions.svg)
+![Illustrative regions with 60%, 30%, and 10% of eligible destination cells](docs/images/04-proportional-regions.png)
 
 Suppose regions **A**, **B**, and **C** contain 60%, 30%, and 10% of eligible destinations. Larger regions generally offer more opportunities, but the plugin also considers confirmed-visit history to give relatively neglected regions more attention.
 
@@ -88,7 +88,7 @@ This **does not** prescribe six visits to A, three to B, and one to C out of eve
 
 ### 5. Failed destination: continue and retry promptly
 
-![A failed route can be followed by another available destination immediately, while repeated retries use a progressive 1–8 second delay](docs/images/05-failure-cooldown-retry.svg)
+![A failed route can be followed by another available destination immediately, while repeated retries use a progressive 1–8 second delay](docs/images/05-failure-cooldown-retry.png)
 
 An interrupted or unsuccessful route **does not count as a visit**. A failed destination should not block other available choices.
 
@@ -101,7 +101,7 @@ Progressive backoff avoids repeated unsuccessful routes without delaying usable 
 
 ### 6. Strategic transit through an already completed block
 
-![Travel from A to a pending destination in C through completed block B, without another visit to B](docs/images/06-transit-through-completed-block.svg)
+![Travel from A to a pending destination in C through completed block B, without another visit to B](docs/images/06-transit-through-completed-block.png)
 
 The character has an outstanding coverage destination in **C**, but the available corridor crosses block **B**, whose quota is already complete (`2/2`).
 

@@ -46,7 +46,7 @@ As figuras são representações didáticas de possíveis decisões do planejado
 
 ### 1. Mapa aberto: explorar sem cruzamentos desnecessários
 
-![Grade aberta 2×2 e uma sequência ilustrativa de visitas entre blocos vizinhos](docs/images/01-simple-block-coverage.pt-BR.svg)
+![Grade aberta 2×2 e uma sequência ilustrativa de visitas entre blocos vizinhos](docs/images/01-simple-block-coverage.pt-BR.png)
 
 Com **quatro blocos** e `lockMapSweep_cellsPerBlock 2`, cada bloco tem até duas visitas de cobertura por rodada. Num mapa aberto, uma sequência ilustrativa coerente é **1 → 2 → 3 → 4 → 8 → 7 → 6 → 5**: após o ponto 4, o personagem já está próximo do bloco inferior direito, sem precisar atravessar toda a grade até o ponto 5.
 
@@ -54,7 +54,7 @@ O plugin considera os custos de deslocamento, as quotas pendentes e o histórico
 
 ### 2. Mapa recortado: duas regiões no mesmo bloco
 
-![Duas regiões do mesmo bloco separadas por parede com conexão por outro bloco](docs/images/02-fragmented-connected-regions.pt-BR.svg)
+![Duas regiões do mesmo bloco separadas por parede com conexão por outro bloco](docs/images/02-fragmented-connected-regions.pt-BR.png)
 
 Uma parede separa as regiões **A** e **B** do bloco superior. Para ir de A até B, o personagem precisa descer até **C**, no bloco inferior, e subir pelo outro lado.
 
@@ -66,7 +66,7 @@ Uma parede separa as regiões **A** e **B** do bloco superior. Para ir de A até
 
 ### 3. Desvios caros: adiar pode ser mais eficiente
 
-![Destino próximo escolhido antes de outro destino alcançável que exige um longo desvio](docs/images/03-avoid-costly-detours.pt-BR.svg)
+![Destino próximo escolhido antes de outro destino alcançável que exige um longo desvio](docs/images/03-avoid-costly-detours.pt-BR.png)
 
 Imagine dois destinos de cobertura pendentes: **A** está no caminho próximo e **B** fica atrás de um obstáculo. Embora B seja alcançável por um corredor mais longo, tentar visitá-lo agora exigiria um grande desvio.
 
@@ -78,7 +78,7 @@ Imagine dois destinos de cobertura pendentes: **A** está no caminho próximo e 
 
 ### 4. Regiões desiguais: cobrir sem esquecer os cantos
 
-![Distribuição ilustrativa de regiões com 60%, 30% e 10% das células elegíveis](docs/images/04-proportional-regions.pt-BR.svg)
+![Distribuição ilustrativa de regiões com 60%, 30% e 10% das células elegíveis](docs/images/04-proportional-regions.pt-BR.png)
 
 Suponha que as regiões **A**, **B** e **C** representem 60%, 30% e 10% dos destinos elegíveis. Em geral, regiões maiores terão mais oportunidades de escolha, mas o plugin também leva em conta o histórico para ajustar a prioridade das regiões pouco visitadas.
 
@@ -88,7 +88,7 @@ Isso **não** significa uma agenda de seis visitas em A, três em B e uma em C a
 
 ### 5. Destino falhou: continuar e tentar novamente com rapidez
 
-![Se uma rota falha, o plugin pode escolher outra opção imediatamente; quando necessário, usa retentativas progressivas de 1 a 8 segundos](docs/images/05-failure-cooldown-retry.pt-BR.svg)
+![Se uma rota falha, o plugin pode escolher outra opção imediatamente; quando necessário, usa retentativas progressivas de 1 a 8 segundos](docs/images/05-failure-cooldown-retry.pt-BR.png)
 
 Uma rota interrompida ou malsucedida **não conta como visita**. O destino que falhou não deve impedir o uso de outras opções disponíveis.
 
@@ -101,7 +101,7 @@ A espera progressiva evita repetição excessiva de rotas malsucedidas sem imped
 
 ### 6. Trânsito estratégico por blocos já concluídos
 
-![Deslocamento de A até C pelo corredor do bloco B já concluído, sem contabilizar visita em B](docs/images/06-transit-through-completed-block.pt-BR.svg)
+![Deslocamento de A até C pelo corredor do bloco B já concluído, sem contabilizar visita em B](docs/images/06-transit-through-completed-block.pt-BR.png)
 
 O personagem tem uma visita pendente em **C**, mas o caminho disponível passa pelo corredor do bloco **B**, cuja quota já foi concluída (`2/2`).
 
