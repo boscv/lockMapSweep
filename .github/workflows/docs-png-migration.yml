@@ -41,7 +41,7 @@ jobs:
                       raise RuntimeError(f"Missing source SVG: {svg}")
                   cairosvg.svg2png(url=str(svg), write_to=str(png), scale=2)
                   with png.open("rb") as f:
-                      if f.read(8) != b"\\x89PNG\\r\\n\\x1a\\n":
+                      if f.read(8) != bytes.fromhex("89504e470d0a1a0a"):
                           raise RuntimeError(f"Invalid PNG: {png}")
                   svg.unlink()
 
@@ -54,7 +54,7 @@ jobs:
                   if s.count(old) != 1:
                       raise RuntimeError(f"Expected exactly one link to {old}")
                   s = s.replace(old, new)
-              if re.search(r"docs/images/[^)\\s]+\\.svg", s):
+              if ".svg" in " ".join(line for line in s.splitlines() if "docs/images/" in line):
                   raise RuntimeError(f"Remaining SVG link in {name}")
               p.write_text(s, encoding="utf-8")
           Path(".github/workflows/docs-png-migration.yml").unlink()
