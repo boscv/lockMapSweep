@@ -82,7 +82,7 @@ With state-file saving enabled, lockMapSweep stores confirmed block visits for t
 
 State files are written through a temporary file and replaced atomically to reduce the risk of a partially written save.
 
-If an active plugin-owned route becomes invalid after a relevant configuration change, the plugin can cancel and recalculate it. If no valid plan can be built under the new configuration, it pauses its sweep instead of knowingly following stale constraints. Globally connected obligations can remain deferred when they exceed the bounded optional-detour policy; there is no promise that every deferred region will be serviced promptly. In other situations, where an otherwise ready plan cannot select a destination, OpenKore's normal random-walk fallback may still be used.
+If an active plugin-owned route becomes invalid after a relevant configuration change, the plugin can cancel and recalculate it. If no valid plan can be built under the new configuration, it pauses its sweep instead of knowingly following stale constraints. Globally connected obligations can remain deferred when they exceed the bounded optional-detour policy; there is no promise that every deferred region will be serviced promptly. In other situations, where an otherwise ready plan cannot select a destination, OpenKore's normal random-walk fallback may still be used. When route failures temporarily exhaust every unused destination for the remaining quotas, the plugin keeps those quotas pending, suppresses the default random-walk fallback, and retries failed destinations after a 30-second cooldown. Repeatedly unavailable destinations remain deferred and never count as visits.
 
 ## Compatibility and planning limits
 

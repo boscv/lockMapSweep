@@ -40,6 +40,7 @@ my $cmd_hooks = Commands::register(
 my $MAX_REASONABLE_DETOUR = 24;
 my $GLOBAL_PLAN_TEMPERATURE = $MAX_REASONABLE_DETOUR;
 my $STRATEGIC_WAYPOINT_STEPS = 96;
+my $FAILED_TARGET_RETRY_SECONDS = 30;
 
 my $strategic_search_cache;
 
@@ -80,6 +81,7 @@ my %state = (
 		restriction_signature => '',
 	pending_target => undef,
 	failed_targets_by_block => {},
+	failed_retry_after => 0,
 	failed_config_signature => undef,
 );
 
@@ -207,6 +209,9 @@ sub on_ai_process_random_walk {
 		warning "[lockMapSweep] State is not ready, falling back to default randomWalk.\n", 'system';
 		return;
 	}
+	if (release_failed_targets_if_due()) {
+		persist_state();
+	}
 
 	if ($state{pending_target}) {
 		if (character_at_pending_target()) {
@@ -233,12 +238,17 @@ sub on_ai_process_random_walk {
 			$state{current_block} + 1,
 			$block ? $block->{walkable_count} : 0,
 		), 'system';
+		if (failure_retry_wait_active()) {
+			diagnose_failed_target_exhaustion();
+			$args->{return} = 1;
+			return;
+		}
 		return;
 	}
 
 	my $attack_auto = Misc::getAttackAutoMode();
 	my $attack_on_route = (!defined $attack_auto || $attack_auto < 0) ? 0 : ($attack_auto >= 2 ? 2 : 1);
-	$state{current_block} = $target->{block_idx};
+	set_current_block($target->{block_idx});
 	$state{pending_target} = {
 		block_idx => $target->{block_idx},
 		region_key => $target->{region_key},
@@ -271,6 +281,7 @@ sub on_ai_process_random_walk {
 	if (!$queued) {
 		my $error_text = $@ || 'unknown route creation error';
 		reject_pending_target("could not queue route: $error_text");
+		$args->{return} = 1;
 		return;
 	}
 	persist_state();
@@ -372,7 +383,7 @@ sub complete_pending_target {
 	$state{region_visit_history}{$pending->{region_key}}++ if $pending->{region_key};
 	$state{last_target} = { x => $pending->{x}, y => $pending->{y} };
 	$state{last_block} = $block_idx;
-	$state{visits_in_block} = $state{block_visit_counts}{$block_idx};
+	set_current_block($block_idx);
 	$state{visited_blocks_in_cycle}{$block_idx} = 1
 		if remaining_block_visits($block_idx) <= 0;
 	advance_plan();
@@ -388,6 +399,7 @@ sub reject_pending_target {
 	my $key = $block ? block_key($block) : $pending->{block_idx};
 	$state{failed_targets_by_block}{$key} ||= {};
 	$state{failed_targets_by_block}{$key}{"$pending->{x},$pending->{y}"} = 1;
+	$state{failed_retry_after} = int(time()) + $FAILED_TARGET_RETRY_SECONDS;
 	$strategic_search_cache = undef;
 	persist_state() if $state{ready};
 	warning sprintf("[lockMapSweep] Route to %d, %d did not complete (%s); progress was not advanced.\n",
@@ -446,6 +458,7 @@ sub initialize_or_reload {
 		restriction_signature => '',
 		pending_target => undef,
 		failed_targets_by_block => {},
+		failed_retry_after => 0,
 		failed_config_signature => undef,
 		);
 	my $restore_previous = sub {
@@ -613,11 +626,10 @@ sub build_block_plan {
 		}
 	}
 
-	$state{current_block} = first_non_empty_block();
-	$state{visits_in_block} = 0;
+	$state{block_visit_counts} = {};
+	set_current_block(first_non_empty_block());
 	$state{used_targets_by_block} = {};
 	$state{visited_blocks_in_cycle} = {};
-	$state{block_visit_counts} = {};
 	$state{region_visit_history} = {} unless ref($state{region_visit_history}) eq 'HASH';
 	$state{round_number} = 1 unless $state{round_number};
 	$state{deferred_blocks} = {};
@@ -964,6 +976,17 @@ sub first_non_empty_block {
 	return 0;
 }
 
+# The per-block table is authoritative. Keep the legacy current-block counter
+# synchronized whenever the selected block changes, and before persistence.
+sub set_current_block {
+	my ($block_idx) = @_;
+	return 0 unless defined $block_idx && $block_idx =~ /^\d+$/;
+	return 0 if $state{block_count} && $block_idx >= $state{block_count};
+	$state{current_block} = int($block_idx);
+	$state{visits_in_block} = $state{block_visit_counts}{$state{current_block}} || 0;
+	return 1;
+}
+
 sub align_current_block_to_origin {
 	my ($origin) = @_;
 	return unless $origin && !$state{pending_target};
@@ -971,8 +994,7 @@ sub align_current_block_to_origin {
 	return unless defined $block_idx && $state{bounds}->[$block_idx]
 		&& $state{bounds}->[$block_idx]{walkable_count} > 0;
 	return if $block_idx == $state{current_block};
-	$state{current_block} = $block_idx;
-	$state{visits_in_block} = 0;
+	set_current_block($block_idx);
 	$state{last_block} = undef;
 	$state{last_target} = undef;
 }
@@ -1120,6 +1142,7 @@ sub pick_target_in_current_plan {
 	return undef unless $from && defined $from->{x} && defined $from->{y};
 	return undef unless defined coord_to_block_index($from->{x}, $from->{y});
 	start_new_coverage_round() if coverage_round_is_complete();
+	return undef if failure_retry_wait_active();
 
 	my $decision_started = time();
 	my $goal_index_started = time();
@@ -1273,7 +1296,12 @@ sub select_strategic_transit_target {
 		}
 	}
 	unless (@pending_regions && $pending_targets) {
-		refresh_deferred_blocks({}, 'no unused eligible targets remain for pending block quotas');
+		my ($unused_targets, $failed_targets) = pending_target_availability();
+		if (!$unused_targets && $failed_targets) {
+			diagnose_failed_target_exhaustion();
+		} else {
+			refresh_deferred_blocks({}, 'no unused eligible targets remain for pending block quotas');
+		}
 		message sprintf("[lockMapSweep] Planning diagnosis: no usable pending destinations (pendingRegions=%d pendingTargets=%d localCells=%d elapsedMs=%.1f).\n",
 			scalar(@pending_regions), $pending_targets, $local_cells_examined || 0, (time() - $started) * 1000), 'route';
 		return undef;
@@ -1449,6 +1477,74 @@ sub refresh_deferred_blocks {
 	persist_state() if $changed && $state{ready};
 }
 
+sub pending_target_availability {
+	my ($unused, $failed) = (0, 0);
+	for my $region (@{$state{regions}}) {
+		my $block_idx = $region->{block_idx};
+		next unless remaining_block_visits($block_idx) > 0;
+		my $block = $state{bounds}[$block_idx] or next;
+		my $key = block_key($block);
+		my $used = $state{used_targets_by_block}{$key} || {};
+		my $blocked = $state{failed_targets_by_block}{$key} || {};
+		for my $packed (@{$region->{target_cells} || []}) {
+			my ($x, $y) = unpack_region_target($packed);
+			my $cell = "$x,$y";
+			next if $used->{$cell};
+			if ($blocked->{$cell}) { $failed++; }
+			else { $unused++; }
+		}
+	}
+	return ($unused, $failed);
+}
+
+sub failure_retry_wait_active {
+	my $retry_after = $state{failed_retry_after} || 0;
+	return 0 unless $retry_after > time();
+	my ($unused, $failed) = pending_target_availability();
+	return $failed > 0 && $unused == 0 ? 1 : 0;
+}
+
+sub release_failed_targets_if_due {
+	my $retry_after = $state{failed_retry_after} || 0;
+	return 0 if $retry_after > time();
+	my $has_failed = 0;
+	for my $targets (values %{$state{failed_targets_by_block} || {}}) {
+		if (ref($targets) eq 'HASH' && keys %$targets) { $has_failed = 1; last; }
+	}
+	return 0 unless $has_failed;
+	$state{failed_targets_by_block} = {};
+	$state{failed_retry_after} = 0;
+	for my $idx (keys %{$state{deferred_blocks}}) {
+		delete $state{deferred_blocks}{$idx}
+			if ($state{deferred_blocks}{$idx}{reason} || '') =~ /all remaining destinations failed/;
+	}
+	message "[lockMapSweep] Failed destinations are eligible for a controlled retry; coverage quotas remain pending.\n", 'route';
+	return 1;
+}
+
+sub diagnose_failed_target_exhaustion {
+	my $retry_after = $state{failed_retry_after} || (int(time()) + $FAILED_TARGET_RETRY_SECONDS);
+	$state{failed_retry_after} = $retry_after;
+	my $reason = "all remaining destinations failed; coverage is blocked until retry at $retry_after";
+	my $changed = 0;
+	for my $idx (0 .. $#{$state{bounds}}) {
+		my $remaining = remaining_block_visits($idx);
+		next unless $remaining > 0;
+		my $old = $state{deferred_blocks}{$idx};
+		next if $old && ($old->{reason} || '') eq $reason
+			&& $old->{remaining} == $remaining && $old->{round} == $state{round_number};
+		$state{deferred_blocks}{$idx} = {
+			remaining => $remaining,
+			round => $state{round_number},
+			reason => $reason,
+		};
+		$changed = 1;
+	}
+	warning "[lockMapSweep] Coverage blocked: every unused destination has a failed route; quotas are retained and retry is scheduled after $retry_after.\n", 'route'
+		if $changed;
+	persist_state() if $changed && $state{ready};
+}
+
 sub block_visit_quota {
 	my ($block_idx) = @_;
 	my $block = $state{bounds}->[$block_idx] or return 0;
@@ -1472,7 +1568,8 @@ sub coverage_round_is_complete {
 sub start_new_coverage_round {
 	$state{round_number}++;
 	$state{block_visit_counts} = {};
-	$state{visits_in_block} = 0;
+	set_current_block($state{current_block});
+	$state{failed_retry_after} = 0;
 	$state{visited_blocks_in_cycle} = {};
 	$state{used_targets_by_block} = {};
 	$state{failed_targets_by_block} = {};
@@ -1960,8 +2057,7 @@ sub complete_empty_block {
 		delete $state{failed_targets_by_block}{block_key($block)};
 	}
 	$state{last_block} = $block_idx;
-	$state{visits_in_block} = 0;
-	$state{current_block} = pick_next_block($block_idx);
+	set_current_block(pick_next_block($block_idx));
 }
 
 sub path_exists_with_allowed_blocks {
@@ -2281,6 +2377,9 @@ sub load_state_from_file {
 	}
 
 	return 0 unless $meta{version} && $meta{version} =~ /^(?:5|6)$/;
+	return 0 if defined $meta{failed_retry_after}
+		&& ($meta{failed_retry_after} !~ /^\d{1,11}$/ || $meta{failed_retry_after} > 4_102_444_800);
+	return 0 if ($meta{failed_retry_after} || 0) && !keys %failed_targets;
 	return 0 if $meta{version} eq '5' && $pending && $pending->{transit};
 	return 0 unless $meta{map} && $meta{map} eq $state{last_lock_map};
 	return 0 unless defined $meta{width} && $meta{width} == $state{width};
@@ -2377,8 +2476,8 @@ sub load_state_from_file {
 	$quota = $state{cells_per_block} if $quota > $state{cells_per_block};
 	return 0 if $current_visits > $quota;
 
-	$state{current_block} = int($meta{current_block});
-	$state{visits_in_block} = int($meta{visits_in_block});
+	$state{block_visit_counts} = \%round_visits;
+	set_current_block(int($meta{current_block}));
 	$state{bounds} = \@restored_bounds;
 	$state{walk_min_x} = int($meta{walk_min_x});
 	$state{walk_max_x} = int($meta{walk_max_x});
@@ -2386,7 +2485,7 @@ sub load_state_from_file {
 	$state{walk_max_y} = int($meta{walk_max_y});
 	$state{visited_blocks_in_cycle} = \%visited_blocks;
 	$state{round_number} = int($meta{round_number});
-	$state{block_visit_counts} = \%round_visits;
+	$state{failed_retry_after} = int($meta{failed_retry_after} || 0);
 	$state{region_visit_history} = \%region_visits;
 	$state{deferred_blocks} = \%deferred;
 	$state{used_targets_by_block} = {};
@@ -2407,6 +2506,7 @@ sub persist_state {
 	return 0 unless $state{state_file};
 
 	return 0 unless $state{ready};
+	return 0 unless set_current_block($state{current_block});
 	my (undef, $dir) = File::Spec->splitpath($state{state_file});
 	$dir ||= '.';
 	eval { make_path($dir) unless -d $dir; 1 } or do {
@@ -2434,6 +2534,7 @@ sub persist_state {
 		print {$fh} "meta\tgeometry\t$state{geometry_signature}\n";
 		print {$fh} "meta\tcurrent_block\t$state{current_block}\n";
 		print {$fh} "meta\tvisits_in_block\t$state{visits_in_block}\n";
+		print {$fh} "meta\tfailed_retry_after\t" . ($state{failed_retry_after} || 0) . "\n";
 		print {$fh} "meta\tround_number\t$state{round_number}\n";
 		print {$fh} "meta\twalk_min_x\t$state{walk_min_x}\n";
 		print {$fh} "meta\twalk_max_x\t$state{walk_max_x}\n";
