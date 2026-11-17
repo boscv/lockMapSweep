@@ -77,6 +77,7 @@ my %state = (
 	region_visit_history => {},
 	round_number => 1,
 	deferred_blocks => {},
+	same_cell_recovery => undef,
 	geometry_signature => '',
 		restriction_signature => '',
 	pending_target => undef,
@@ -224,7 +225,21 @@ sub on_ai_process_random_walk {
 		}
 	}
 
-	my $target = pick_target_in_current_plan();
+	my $target;
+	if ($state{same_cell_recovery}) {
+		if (failure_retry_wait_active()) {
+			diagnose_failed_target_exhaustion();
+			$args->{return} = 1;
+			return;
+		}
+		$target = resume_same_cell_recovery($origin);
+		if (!$target) {
+			$args->{return} = 1;
+			return;
+		}
+	} else {
+		$target = pick_target_in_current_plan();
+	}
 	if (!$target) {
 		my $has_origin = $origin && defined $origin->{x} && defined $origin->{y};
 		my $origin_key = $has_origin ? "$origin->{x},$origin->{y}" : 'unknown';
@@ -245,6 +260,14 @@ sub on_ai_process_random_walk {
 		}
 		return;
 	}
+	if (!$target->{transit} && $origin
+		&& same_position({ x => $target->{x}, y => $target->{y} }, $origin)) {
+		$target = begin_same_cell_recovery($target, $origin);
+		unless ($target) {
+			$args->{return} = 1;
+			return;
+		}
+	}
 
 	my $attack_auto = Misc::getAttackAutoMode();
 	my $attack_on_route = (!defined $attack_auto || $attack_auto < 0) ? 0 : ($attack_auto >= 2 ? 2 : 1);
@@ -258,16 +281,6 @@ sub on_ai_process_random_walk {
 		from_y => $target->{from_y},
 		transit => $target->{transit} ? 1 : 0,
 	};
-	# A strategic coverage goal can already be the settled character position
-	# (for example, the only eligible cell at the start of a new round). It is
-	# an intentional coverage destination, not a transit waypoint, so settle it
-	# from the authoritative position instead of queuing a zero-length route.
-	if (!$target->{transit} && $origin
-		&& same_position({ x => $target->{x}, y => $target->{y} }, $origin)) {
-		complete_pending_target() if character_at_pending_target();
-		$args->{return} = 1;
-		return;
-	}
 	if ($target->{transit}) {
 		message sprintf("[lockMapSweep] Calculating strategic transit route to block %d: %d, %d toward region %s (goal cost %d, waypoint %d).\n",
 			$target->{block_idx} + 1, $target->{x}, $target->{y},
@@ -362,6 +375,131 @@ sub character_at_pending_target {
 	return actorFinishedMovement($char, $field, 0, 1) ? 1 : 0;
 }
 
+sub begin_same_cell_recovery {
+	my ($target, $origin) = @_;
+	my $recovery = {
+		phase => 'stage',
+		block_idx => $target->{block_idx},
+		x => $target->{x}, y => $target->{y},
+		region_key => $target->{region_key},
+		stage_x => -1, stage_y => -1,
+		retry_after => 0,
+	};
+	$state{same_cell_recovery} = $recovery;
+	return staging_target_from_recovery($recovery, $origin);
+}
+
+sub resume_same_cell_recovery {
+	my ($origin) = @_;
+	my $recovery = $state{same_cell_recovery} or return undef;
+	return undef unless $origin && defined $origin->{x} && defined $origin->{y};
+	if ($recovery->{phase} eq 'blocked') {
+		return undef if ($recovery->{retry_after} || 0) > time();
+		$recovery->{phase} = 'stage';
+		$recovery->{retry_after} = 0;
+	}
+	if ($recovery->{phase} eq 'stage') {
+		return staging_target_from_recovery($recovery, $origin);
+	}
+	return undef unless $recovery->{phase} eq 'return';
+	if (same_position($origin, { x => $recovery->{x}, y => $recovery->{y} })) {
+		$recovery->{phase} = 'stage';
+		$recovery->{stage_x} = -1;
+		$recovery->{stage_y} = -1;
+		return staging_target_from_recovery($recovery, $origin);
+	}
+	return undef unless actorFinishedMovement($char, $field, 0, 1);
+	return {
+		block_idx => $recovery->{block_idx}, region_key => $recovery->{region_key},
+		x => $recovery->{x}, y => $recovery->{y},
+		from_x => $origin->{x}, from_y => $origin->{y}, transit => 0,
+	};
+}
+
+sub staging_target_from_recovery {
+	my ($recovery, $origin) = @_;
+	my $stage = find_recovery_staging_cell($origin, $recovery);
+	unless ($stage) {
+		$recovery->{phase} = 'blocked';
+		$recovery->{stage_x} = -1;
+		$recovery->{stage_y} = -1;
+		$recovery->{retry_after} = int(time()) + $FAILED_TARGET_RETRY_SECONDS;
+		my $idx = $recovery->{block_idx};
+		$state{deferred_blocks}{$idx} = {
+			remaining => remaining_block_visits($idx),
+			round => $state{round_number},
+			reason => "occupied-only coverage target has no reachable staging cell; retry after $recovery->{retry_after}",
+		};
+		warning sprintf("[lockMapSweep] Coverage blocked in block %d: the only pending destination is occupied and no legal staging cell is reachable; retry scheduled after %d.\n",
+			$idx + 1, $recovery->{retry_after}), 'route';
+		persist_state();
+		return undef;
+	}
+	$recovery->{phase} = 'stage';
+	$recovery->{stage_x} = $stage->{x};
+	$recovery->{stage_y} = $stage->{y};
+	$recovery->{retry_after} = 0;
+	delete $state{deferred_blocks}{$recovery->{block_idx}};
+	my $stage_region_id = region_id_at($stage->{x}, $stage->{y});
+	my $stage_region = defined $stage_region_id ? $state{regions}[$stage_region_id] : undef;
+	my $stage_block = coord_to_block_index($stage->{x}, $stage->{y});
+	return undef unless $stage_region && defined $stage_block;
+	return {
+		block_idx => $stage_block, region_key => $stage_region->{key},
+		x => $stage->{x}, y => $stage->{y},
+		from_x => $origin->{x}, from_y => $origin->{y},
+		transit => 1, recovery_stage => 1,
+		goal_region_key => $recovery->{region_key},
+		goal_cost => $stage->{cost}, waypoint_cost => $stage->{cost},
+	};
+}
+
+sub find_recovery_staging_cell {
+	my ($origin, $recovery) = @_;
+	return undef unless $origin && $field && is_cell_reachable($origin->{x}, $origin->{y});
+	my $max_steps = 8;
+	my ($costs) = cell_route_tree_from($origin, $max_steps, 0);
+	my @staging;
+	my $min_x = $origin->{x} - $max_steps;
+	my $max_x = $origin->{x} + $max_steps;
+	my $min_y = $origin->{y} - $max_steps;
+	my $max_y = $origin->{y} + $max_steps;
+	$min_x = 0 if $min_x < 0;
+	$min_y = 0 if $min_y < 0;
+	$max_x = $state{width} - 1 if $max_x >= $state{width};
+	$max_y = $state{height} - 1 if $max_y >= $state{height};
+	for my $y ($min_y .. $max_y) {
+		for my $x ($min_x .. $max_x) {
+			my $cost = $costs->{"$x,$y"};
+			next unless defined $cost && $cost > 0;
+			next if $x == $recovery->{x} && $y == $recovery->{y};
+			next unless is_cell_reachable($x, $y) && $field->isWalkable($x, $y);
+			push @staging, {
+				x => $x, y => $y, cost => $cost,
+				eligible => is_cell_eligible($x, $y) ? 1 : 0,
+			};
+		}
+	}
+	return undef unless @staging;
+	@staging = sort {
+		$a->{cost} <=> $b->{cost}
+		|| $a->{eligible} <=> $b->{eligible}
+		|| $a->{y} <=> $b->{y}
+		|| $a->{x} <=> $b->{x}
+	} @staging;
+	return $staging[0];
+}
+
+sub pending_is_recovery_stage {
+	my ($pending) = @_;
+	$pending ||= $state{pending_target};
+	return 0 unless $pending;
+	my $recovery = $state{same_cell_recovery} or return 0;
+	return 0 unless $recovery->{phase} eq 'stage' && $pending->{transit};
+	return $pending->{x} == $recovery->{stage_x}
+		&& $pending->{y} == $recovery->{stage_y};
+}
+
 sub character_moving_to_pending_target {
 	my $pending = $state{pending_target};
 	return 0 unless $pending && $char && $field;
@@ -380,6 +518,21 @@ sub complete_pending_target {
 		return 0;
 	}
 	if ($pending->{transit}) {
+		if (pending_is_recovery_stage($pending)) {
+			my $recovery = $state{same_cell_recovery};
+			unless (!same_position({ x => $pending->{x}, y => $pending->{y} },
+				{ x => $recovery->{x}, y => $recovery->{y} })) {
+				$state{same_cell_recovery} = undef;
+				return 0;
+			}
+			$recovery->{phase} = 'return';
+			$recovery->{retry_after} = 0;
+			delete $state{deferred_blocks}{$recovery->{block_idx}};
+			persist_state();
+			message sprintf("[lockMapSweep] Reached staging position at %d, %d; no coverage visit credited, returning to %d, %d.\n",
+				$pending->{x}, $pending->{y}, $recovery->{x}, $recovery->{y}), 'route';
+			return 1;
+		}
 		persist_state();
 		message sprintf("[lockMapSweep] Reached strategic transit waypoint at %d, %d; no block visit credited.\n",
 			$pending->{x}, $pending->{y}), 'route';
@@ -393,6 +546,12 @@ sub complete_pending_target {
 	$state{region_visit_history}{$pending->{region_key}}++ if $pending->{region_key};
 	$state{last_target} = { x => $pending->{x}, y => $pending->{y} };
 	$state{last_block} = $block_idx;
+	if (my $recovery = $state{same_cell_recovery}) {
+		$state{same_cell_recovery} = undef
+			if $recovery->{phase} eq 'return'
+				&& $pending->{block_idx} == $recovery->{block_idx}
+				&& $pending->{x} == $recovery->{x} && $pending->{y} == $recovery->{y};
+	}
 	set_current_block($block_idx);
 	$state{visited_blocks_in_cycle}{$block_idx} = 1
 		if remaining_block_visits($block_idx) <= 0;
@@ -405,6 +564,21 @@ sub complete_pending_target {
 sub reject_pending_target {
 	my ($reason) = @_;
 	my $pending = delete $state{pending_target} or return 0;
+	if ($pending->{transit} && pending_is_recovery_stage($pending)) {
+		my $recovery = $state{same_cell_recovery};
+		$recovery->{phase} = 'blocked';
+		$recovery->{retry_after} = int(time()) + $FAILED_TARGET_RETRY_SECONDS;
+		my $idx = $recovery->{block_idx};
+		$state{deferred_blocks}{$idx} = {
+			remaining => remaining_block_visits($idx),
+			round => $state{round_number},
+			reason => "staging route failed; occupied-only destination remains pending until retry after $recovery->{retry_after}",
+		};
+		persist_state() if $state{ready};
+		warning sprintf("[lockMapSweep] Staging route to %d, %d failed (%s); no visit credited and retry scheduled after %d.\n",
+			$pending->{x}, $pending->{y}, $reason || 'unknown route failure', $recovery->{retry_after}), 'route';
+		return 1;
+	}
 	my $block = $state{bounds}->[$pending->{block_idx}];
 	my $key = $block ? block_key($block) : $pending->{block_idx};
 	$state{failed_targets_by_block}{$key} ||= {};
@@ -464,6 +638,7 @@ sub initialize_or_reload {
 		region_visit_history => {},
 		round_number => 1,
 		deferred_blocks => {},
+		same_cell_recovery => undef,
 		geometry_signature => '',
 		restriction_signature => '',
 		pending_target => undef,
@@ -1603,6 +1778,7 @@ sub coverage_round_is_complete {
 sub start_new_coverage_round {
 	$state{round_number}++;
 	$state{block_visit_counts} = {};
+	$state{same_cell_recovery} = undef;
 	set_current_block($state{current_block});
 	$state{failed_retry_after} = 0;
 	$state{visited_blocks_in_cycle} = {};
@@ -2374,7 +2550,7 @@ sub load_state_from_file {
 	close $fh;
 
 	my (%meta, %bounds, %visited_blocks, %used_targets, %failed_targets,
-		%round_visits, %region_visits, %deferred, $pending);
+		%round_visits, %region_visits, %deferred, $pending, $recovery);
 	for my $line (@lines) {
 		chomp $line;
 		next if $line =~ /^\s*$/;
@@ -2396,6 +2572,13 @@ sub load_state_from_file {
 		} elsif ($line =~ /^deferred\t(\d+)\t(\d+)\t(\d+)\t([^\t]*)$/) {
 			return 0 if exists $deferred{$1};
 			$deferred{$1} = { remaining => int($2), round => int($3), reason => $4 };
+		} elsif ($line =~ /^recovery\t(stage|return|blocked)\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)\t(-?\d+)\t(-?\d+)\t(\d+)$/) {
+			return 0 if $recovery;
+			$recovery = {
+				phase => $1, block_idx => int($2), x => int($3), y => int($4),
+				region_key => $5, stage_x => int($6), stage_y => int($7),
+				retry_after => int($8),
+			};
 		} elsif ($line =~ /^target\t(\d+)\t(\d+)\t(\d+)$/) {
 			my ($idx, $x, $y) = ($1, $2, $3);
 			return 0 if $used_targets{$idx}{"$x,$y"}++;
@@ -2416,6 +2599,7 @@ sub load_state_from_file {
 		&& ($meta{failed_retry_after} !~ /^\d{1,11}$/ || $meta{failed_retry_after} > 4_102_444_800);
 	return 0 if ($meta{failed_retry_after} || 0) && !keys %failed_targets;
 	return 0 if $meta{version} eq '5' && $pending && $pending->{transit};
+	return 0 if $meta{version} eq '5' && $recovery;
 	return 0 unless $meta{map} && $meta{map} eq $state{last_lock_map};
 	return 0 unless defined $meta{width} && $meta{width} == $state{width};
 	return 0 unless defined $meta{height} && $meta{height} == $state{height};
@@ -2494,12 +2678,79 @@ sub load_state_from_file {
 			return 0 unless within_block({ x => $x, y => $y }, $block) && is_cell_eligible($x, $y);
 		}
 	}
+	if ($recovery) {
+		return 0 if $recovery->{block_idx} >= $state{block_count};
+		my $target_block = $restored_bounds[$recovery->{block_idx}];
+		return 0 unless within_block({ x => $recovery->{x}, y => $recovery->{y} }, $target_block)
+			&& is_cell_eligible($recovery->{x}, $recovery->{y});
+		my $target_region_id = region_id_at($recovery->{x}, $recovery->{y});
+		return 0 unless defined $target_region_id
+			&& $state{regions}[$target_region_id]{key} eq $recovery->{region_key}
+			&& $state{regions}[$target_region_id]{block_idx} == $recovery->{block_idx};
+		my $target_quota = $target_block->{walkable_count} || 0;
+		$target_quota = $state{cells_per_block} if $target_quota > $state{cells_per_block};
+		return 0 if ($round_visits{$recovery->{block_idx}} || 0) >= $target_quota;
+		return 0 if $used_targets{$recovery->{block_idx}}{"$recovery->{x},$recovery->{y}"};
+		if ($recovery->{phase} eq 'blocked') {
+			return 0 unless $recovery->{retry_after} > 0
+				&& $recovery->{retry_after} <= 4_102_444_800;
+			return 0 if $pending;
+			my $defer = $deferred{$recovery->{block_idx}} or return 0;
+			return 0 unless $defer->{reason} =~ /occupied-only|staging route failed/;
+			if ($recovery->{stage_x} == -1 && $recovery->{stage_y} == -1) {
+				# No reachable staging cell was found; the pair is intentionally empty.
+			} else {
+				return 0 if $recovery->{stage_x} < 0 || $recovery->{stage_y} < 0
+					|| $recovery->{stage_x} >= $state{width} || $recovery->{stage_y} >= $state{height};
+				return 0 if $recovery->{stage_x} == $recovery->{x}
+					&& $recovery->{stage_y} == $recovery->{y};
+				return 0 unless $field->isWalkable($recovery->{stage_x}, $recovery->{stage_y})
+					&& defined region_id_at($recovery->{stage_x}, $recovery->{stage_y});
+			}
+		} else {
+			return 0 unless $recovery->{retry_after} == 0;
+			return 0 if $recovery->{stage_x} < 0 || $recovery->{stage_y} < 0
+				|| $recovery->{stage_x} >= $state{width} || $recovery->{stage_y} >= $state{height};
+			return 0 if $recovery->{stage_x} == $recovery->{x}
+				&& $recovery->{stage_y} == $recovery->{y};
+			return 0 unless $field->isWalkable($recovery->{stage_x}, $recovery->{stage_y});
+			my $stage_region_id = region_id_at($recovery->{stage_x}, $recovery->{stage_y});
+			return 0 unless defined $stage_region_id;
+			my $stage_region_key = $state{regions}[$stage_region_id]{key};
+			my $stage_block_idx = $state{regions}[$stage_region_id]{block_idx};
+			if ($recovery->{phase} eq 'stage') {
+				if ($pending) {
+					return 0 unless $pending->{transit}
+						&& $pending->{x} == $recovery->{stage_x}
+						&& $pending->{y} == $recovery->{stage_y}
+						&& $pending->{region_key} eq $stage_region_key
+						&& $pending->{block_idx} == $stage_block_idx;
+					return 0 unless $pending->{block_idx} == $meta{current_block};
+				} else {
+					# A live config change can cancel the owned staging route. Keep
+					# this validated waypoint as an interrupted recovery phase so
+					# the next enabled randomWalk tick can safely queue it again.
+					return 0 unless $stage_block_idx == $meta{current_block};
+				}
+			} else {
+				return 0 if $pending && ($pending->{transit}
+					|| $pending->{x} != $recovery->{x} || $pending->{y} != $recovery->{y}
+					|| $pending->{block_idx} != $recovery->{block_idx}
+					|| $pending->{region_key} ne $recovery->{region_key});
+			}
+		}
+	}
 	if ($pending) {
 		return 0 if $pending->{block_idx} >= $state{block_count};
 		my $pending_block = $restored_bounds[$pending->{block_idx}];
 		return 0 unless $pending->{block_idx} == $meta{current_block};
+		my $is_staging = $recovery && $recovery->{phase} eq 'stage'
+			&& $pending->{transit} && $pending->{x} == $recovery->{stage_x}
+			&& $pending->{y} == $recovery->{stage_y};
 		return 0 unless within_block({ x => $pending->{x}, y => $pending->{y} }, $pending_block)
-			&& is_cell_eligible($pending->{x}, $pending->{y});
+			&& ($is_staging
+				? $field->isWalkable($pending->{x}, $pending->{y})
+				: is_cell_eligible($pending->{x}, $pending->{y}));
 		my $region_id = region_id_at($pending->{x}, $pending->{y});
 		return 0 unless defined $region_id && $state{regions}[$region_id]{key} eq $pending->{region_key};
 		return 0 unless $state{regions}[$region_id]{block_idx} == $pending->{block_idx};
@@ -2523,6 +2774,7 @@ sub load_state_from_file {
 	$state{failed_retry_after} = int($meta{failed_retry_after} || 0);
 	$state{region_visit_history} = \%region_visits;
 	$state{deferred_blocks} = \%deferred;
+	$state{same_cell_recovery} = $recovery;
 	$state{used_targets_by_block} = {};
 	$state{failed_targets_by_block} = {};
 	for my $idx (keys %used_targets) {
@@ -2597,6 +2849,11 @@ sub persist_state {
 			my $reason = $deferred->{reason} || '';
 			$reason =~ s/[\t\r\n]/ /g;
 			print {$fh} "deferred\t$idx\t$deferred->{remaining}\t$deferred->{round}\t$reason\n";
+		}
+		if (my $recovery = $state{same_cell_recovery}) {
+			print {$fh} join("\t", 'recovery', $recovery->{phase}, $recovery->{block_idx},
+				$recovery->{x}, $recovery->{y}, $recovery->{region_key},
+				$recovery->{stage_x}, $recovery->{stage_y}, $recovery->{retry_after} || 0) . "\n";
 		}
 		if (my $pending = $state{pending_target}) {
 			my $transit_flag = $pending->{transit} ? "\t1" : '';

@@ -4,7 +4,7 @@ use warnings;
 use File::Temp qw(tempdir);
 use Test::More;
 
-our ($route_target, $route_attempts, $movement_settled);
+our ($route_target, $route_attempts, $movement_settled, $ai_route_index, $ai_clear_count);
 
 BEGIN {
 	package Plugins;
@@ -59,6 +59,8 @@ BEGIN {
 	}
 	sub is { 1 }
 	sub args { return { isRandomWalk => 1, dest => { pos => $main::route_target } } }
+	sub findAction { return $main::ai_route_index }
+	sub clear { $main::ai_clear_count++; return 1 }
 	$INC{'AI.pm'} = __FILE__;
 
 	package Misc;
@@ -79,6 +81,7 @@ BEGIN {
 		$walk_queries++;
 		my ($self, $x, $y) = @_;
 		return $x == 1 && $y >= 1 && $y <= 6 if $self->{baseName} eq 'retry_block_switch';
+		return $x == 2 && $y == 1 if $self->{baseName} eq 'retry_no_stage';
 		return $y == 1 && $x >= 1 && $x <= 3;
 	}
 	sub canMove {
@@ -120,7 +123,8 @@ sub configure_fixture {
 		route_randomWalk => 0,
 	);
 	$Globals::field = Field->new(name => $args{map});
-	$Globals::char = { pos => { x => 1, y => 1 }, pos_to => { x => 1, y => 1 } };
+	my $start_x = $args{start_x} || 1;
+	$Globals::char = { pos => { x => $start_x, y => 1 }, pos_to => { x => $start_x, y => 1 } };
 	$route_target = undef;
 	$route_attempts = 0;
 	$movement_settled = 0;
@@ -158,6 +162,11 @@ sub read_state {
 		elsif ($f[0] eq 'failed') { push @{$saved{failed}}, \@f; }
 		elsif ($f[0] eq 'pending') { push @{$saved{pending}}, \@f; }
 		elsif ($f[0] eq 'deferred') { $saved{deferred}{$f[1]} = $f[4]; }
+		elsif ($f[0] eq 'recovery') {
+			$saved{recovery} = { phase => $f[1], block_idx => int($f[2]),
+				x => int($f[3]), y => int($f[4]), region_key => $f[5],
+				stage_x => int($f[6]), stage_y => int($f[7]), retry_after => int($f[8]) };
+		}
 	}
 	close $fh;
 	return \%saved;
@@ -169,6 +178,18 @@ sub expire_saved_retry {
 	my @lines = <$fh>;
 	close $fh;
 	@lines = map { /^meta\tfailed_retry_after\t/ ? "meta\tfailed_retry_after\t0\n" : $_ } @lines;
+	open my $out, '>', $path or die "write $path: $!";
+	print {$out} @lines;
+	close $out;
+}
+
+sub expire_saved_recovery_retry {
+	my ($path) = @_;
+	open my $fh, '<', $path or die "open $path: $!";
+	my @lines = <$fh>;
+	close $fh;
+	my $expired_at = int(time()) - 1;
+	@lines = map { /^recovery\tblocked\t/ ? do { s/\t\d+\n$/\t$expired_at\n/; $_ } : $_ } @lines;
 	open my $out, '>', $path or die "write $path: $!";
 	print {$out} @lines;
 	close $out;
@@ -245,18 +266,165 @@ ok(!keys %{$single_complete->{round_visit}}, 'new round starts with reset block 
 is(0 + (values %{$single_complete->{region_visit}})[0], 1, 'exactly one confirmed region visit is retained');
 is(scalar @{$single_complete->{failed}}, 0, 'round transition clears obsolete failed-target marks');
 
-# A new round may select the sole eligible destination while the character is
-# already standing on it. Treat the settled position as the selected coverage
-# arrival instead of asking OpenKore to construct an unusable zero-length route.
+# A new round cannot credit the only destination while the character remains
+# stationary on it. It must leave through a walkable staging cell and return.
 $movement_settled = 1;
-my $routes_before_same_cell = $route_attempts;
+my $routes_before_staging = $route_attempts;
 tick();
-my $same_cell_complete = read_state($single_state);
-is($same_cell_complete->{meta}{round_number}, 3, 'already occupied target fulfills the next round obligation');
-is(0 + (values %{$same_cell_complete->{region_visit}})[0], 2, 'same-cell coverage selection adds exactly one region visit');
-is($route_attempts, $routes_before_same_cell, 'settled same-cell target does not queue a zero-length route');
-is(scalar @{$same_cell_complete->{pending}}, 0, 'same-cell completion leaves no duplicate pending destination');
+my $stage_pending = read_state($single_state);
+is($stage_pending->{meta}{round_number}, 2, 'occupied destination leaves the new round incomplete');
+is(0 + (values %{$stage_pending->{region_visit}})[0], 1, 'selecting an occupied destination adds no region credit');
+is($route_attempts, $routes_before_staging + 1, 'planner queues one native route to a staging position');
+is($stage_pending->{recovery}{phase}, 'stage', 'staging movement phase is persisted');
+is(scalar @{$stage_pending->{pending}}, 1, 'staging route is persisted as pending');
+is($stage_pending->{pending}[0][5], 1, 'staging route is marked transit and cannot consume quota');
+ok(!lockMapSweep::is_cell_eligible($route_target->{x}, $route_target->{y}),
+	'staging destination may be outside the configured coverage restriction');
+my $stage_target = { %$route_target };
+$Globals::char->{pos_to} = { %$stage_target };
 $movement_settled = 0;
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'reload restores a pending staging route under strict v6 validation');
+my $routes_while_staging = $route_attempts;
+tick();
+is($route_attempts, $routes_while_staging, 'an in-progress staging route is not queued twice after reload');
+is(0 + (values %{read_state($single_state)->{region_visit}})[0], 1,
+	'pending staging movement receives no region credit');
+open my $valid_state_fh, '<', $single_state or die "open $single_state: $!";
+my $valid_stage_state = do { local $/; <$valid_state_fh> };
+close $valid_state_fh;
+my $invalid_stage_state = $valid_stage_state;
+$invalid_stage_state =~ s/^(recovery\tstage\t\d+\t\d+\t\d+\t[^\t]+\t)-?\d+\t-?\d+\t\d+$/${1}4\t1\t0/m
+	or die 'could not corrupt staging coordinate for strict-loader regression';
+open my $invalid_stage_fh, '>', $single_state or die "write $single_state: $!";
+print {$invalid_stage_fh} $invalid_stage_state;
+close $invalid_stage_fh;
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'loader rejects a staging transit coordinate that is not walkable');
+ok(!defined read_state($single_state)->{recovery}, 'invalid staging recovery is discarded instead of trusted');
+open my $restore_stage_fh, '>', $single_state or die "restore $single_state: $!";
+print {$restore_stage_fh} $valid_stage_state;
+close $restore_stage_fh;
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'valid pending staging state reloads after strict rejection check');
+is(read_state($single_state)->{recovery}{phase}, 'stage', 'valid staging phase remains intact after restore');
+route_failure();
+my $stage_failed = read_state($single_state);
+is($stage_failed->{recovery}{phase}, 'blocked', 'failed staging enters a bounded persisted blocked state');
+ok($stage_failed->{recovery}{retry_after} > time(), 'failed staging retains the 30-second recovery delay');
+is(scalar @{$stage_failed->{pending}}, 0, 'failed staging clears only the pending route');
+is(0 + (values %{$stage_failed->{region_visit}})[0], 1, 'failed staging receives no region credit');
+ok(lockMapSweep::initialize_or_reload(undef, { x => 2, y => 1 }),
+	'reload preserves a failed staging recovery phase');
+is(read_state($single_state)->{recovery}{phase}, 'blocked', 'failed staging recovery phase is still present on disk');
+my $routes_during_stage_cooldown = $route_attempts;
+tick();
+is($route_attempts, $routes_during_stage_cooldown, 'failed staging cooldown prevents repeated route attempts');
+expire_saved_recovery_retry($single_state);
+ok(lockMapSweep::initialize_or_reload(undef, { x => 2, y => 1 }),
+	'expired staging cooldown reloads without losing the quota');
+is(read_state($single_state)->{recovery}{phase}, 'blocked', 'expired blocked phase is preserved before retry');
+tick();
+my $staging_retry = read_state($single_state);
+is($staging_retry->{recovery}{phase}, 'stage', 'expired cooldown re-enables staging recovery');
+is($route_attempts, $routes_during_stage_cooldown + 1, 'one staging retry is queued after cooldown');
+$stage_target = { x => int($staging_retry->{pending}[0][2]), y => int($staging_retry->{pending}[0][3]) };
+$Globals::char->{pos_to} = { %$stage_target };
+$movement_settled = 0;
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'reload restores the retried pending staging destination');
+is(read_state($single_state)->{recovery}{phase}, 'stage', 'staging phase survives pending-route reload');
+$movement_settled = 1;
+route_success();
+my $stage_arrived = read_state($single_state);
+is($stage_arrived->{recovery}{phase}, 'return', 'confirmed departure advances recovery to return phase');
+is(scalar @{$stage_arrived->{pending}}, 0, 'completed staging movement clears its transit target');
+is($stage_arrived->{round_visit}{0} || 0, 0, 'staging arrival leaves the block quota unchanged');
+is(0 + (values %{$stage_arrived->{region_visit}})[0], 1, 'staging arrival leaves region history unchanged');
+$movement_settled = 0;
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'reload preserves the confirmed-staging-before-return phase');
+$movement_settled = 1;
+tick();
+is_deeply($route_target, { x => 2, y => 1 }, 'recovery routes back to the original eligible destination');
+my $return_pending = read_state($single_state);
+is($return_pending->{recovery}{phase}, 'return', 'return phase remains persisted while route is pending');
+is($return_pending->{pending}[0][5] || 0, 0, 'return target remains a normal coverage destination');
+is($return_pending->{round_visit}{0} || 0, 0, 'queuing the return does not consume the quota');
+$Globals::char->{pos_to} = { %$route_target };
+$movement_settled = 0;
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'reload restores a pending return route');
+my $routes_during_return = $route_attempts;
+tick();
+is($route_attempts, $routes_during_return, 'pending return route is not duplicated after reload');
+$Globals::char->{pos_to} = { %$stage_target };
+$Globals::char->{pos} = { %$stage_target };
+$movement_settled = 1;
+route_failure();
+my $return_failed = read_state($single_state);
+is($return_failed->{recovery}{phase}, 'return', 'failed return preserves its recovery obligation');
+is($return_failed->{round_visit}{0} || 0, 0, 'failed return receives no block visit credit');
+is(0 + (values %{$return_failed->{region_visit}})[0], 1, 'failed return receives no region visit credit');
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'reload preserves a failed return with its original obligation');
+my $routes_during_return_cooldown = $route_attempts;
+tick();
+is($route_attempts, $routes_during_return_cooldown, 'return failure observes the existing bounded retry cooldown');
+expire_saved_retry($single_state);
+ok(lockMapSweep::initialize_or_reload(undef, $Globals::char->{pos_to}),
+	'expired return cooldown restores normal recovery');
+tick();
+is_deeply($route_target, { x => 2, y => 1 }, 'recovery retries the original destination after cooldown');
+route_success();
+my $returned = read_state($single_state);
+is($returned->{meta}{round_number}, 3, 'one confirmed departure and return completes exactly one quota');
+is($returned->{round_visit}{0} || 0, 0, 'completed round resets only after the real return arrival');
+is(0 + (values %{$returned->{region_visit}})[0], 2, 'one genuine return adds exactly one region visit');
+ok(!defined $returned->{recovery}, 'completed recovery state is cleared');
+
+# Repeated stationary ticks in the next round may stage once but cannot create
+# further region history or round transitions.
+$movement_settled = 1;
+my $routes_before_idle_ticks = $route_attempts;
+tick();
+my $idle_stage = read_state($single_state);
+is($idle_stage->{recovery}{phase}, 'stage', 'next occupied round starts a new staging cycle');
+is($idle_stage->{meta}{round_number}, 3, 'stationary selection does not advance the round');
+is(0 + (values %{$idle_stage->{region_visit}})[0], 2, 'stationary selection does not add region history');
+is($route_attempts, $routes_before_idle_ticks + 1, 'stationary recovery queues one staging route only');
+$Globals::char->{pos_to} = { %$route_target };
+$movement_settled = 0;
+for (1 .. 4) { tick(); }
+my $idle_repeated = read_state($single_state);
+is($idle_repeated->{meta}{round_number}, 3, 'repeated ticks during staging cannot manufacture coverage rounds');
+is(0 + (values %{$idle_repeated->{region_visit}})[0], 2, 'repeated ticks during staging cannot manufacture region visits');
+is($route_attempts, $routes_before_idle_ticks + 1, 'repeated ticks do not duplicate the pending staging route');
+
+# A live disable can interrupt a queued stage. Preserve the recovery obligation
+# without a pending route, then reload and queue staging again when re-enabled.
+$ai_route_index = 0;
+$ai_clear_count = 0;
+$Globals::config{lockMapSweep_enabled} = 0;
+lockMapSweep::on_config_modify(undef, { key => 'lockMapSweep_enabled' });
+my $interrupted_stage = read_state($single_state);
+is($ai_clear_count, 1, 'config disable interrupts the plugin-owned staging route');
+is(scalar @{$interrupted_stage->{pending}}, 0, 'interrupted staging clears only its route target');
+is($interrupted_stage->{recovery}{phase}, 'stage', 'interrupted staging obligation remains persisted');
+is(0 + (values %{$interrupted_stage->{region_visit}})[0], 2,
+	'interrupted staging still has no coverage credit');
+$Globals::config{lockMapSweep_enabled} = 1;
+ok(lockMapSweep::initialize_or_reload(undef, { x => 2, y => 1 }),
+	'reload accepts only a validated interrupted staging phase without a pending route');
+is(read_state($single_state)->{recovery}{phase}, 'stage',
+	'interrupted staging phase survives strict v6 reload');
+my $routes_after_interrupted_stage = $route_attempts;
+tick();
+is($route_attempts, $routes_after_interrupted_stage + 1,
+	're-enabled recovery queues a native staging route again');
+is(read_state($single_state)->{round_visit}{0} || 0, 0,
+	're-queued staging still does not consume the block quota');
+$ai_route_index = undef;
 
 strip_retry_meta($single_state);
 ok(lockMapSweep::initialize_or_reload(undef, { x => 1, y => 1 }), 'existing v6 state without retry metadata remains loadable');
@@ -266,6 +434,29 @@ ok(lockMapSweep::initialize_or_reload(undef, { x => 1, y => 1 }), 'malformed ret
 my $invalid_retry = read_state($single_state);
 is($invalid_retry->{meta}{round_number}, 1, 'invalid retry deadline starts a clean state instead of importing malformed history');
 ok(!keys %{$invalid_retry->{region_visit}}, 'invalid retry deadline does not import region history');
+
+# A one-cell component has no departure path. Preserve its obligation in a
+# bounded, explicit state instead of inventing an arrival.
+ok(configure_fixture(map => 'retry_no_stage', lock_x => 2, quota => 1, start_x => 2),
+	'initialize a fixture with no reachable staging cell');
+my $no_stage_state = "$state_dir/retry_no_stage_1x1_c1_v6.state";
+my $no_stage_routes = $route_attempts;
+my $no_stage_args = tick();
+my $no_stage_blocked = read_state($no_stage_state);
+is($no_stage_blocked->{recovery}{phase}, 'blocked', 'no-stage topology is recorded as explicitly blocked');
+ok($no_stage_blocked->{recovery}{retry_after} > time(), 'no-stage block has a bounded retry time');
+like(join(' ', values %{$no_stage_blocked->{deferred}}), qr/no reachable staging cell/,
+	'no-stage topology records a clear deferred-obligation reason');
+ok($no_stage_args->{return}, 'blocked occupied target consumes randomWalk rather than falling through');
+is($no_stage_blocked->{meta}{round_number}, 1, 'no-stage topology retains the unfinished round');
+is(scalar keys %{$no_stage_blocked->{region_visit}}, 0, 'no-stage topology creates no region visit');
+is($route_attempts, $no_stage_routes, 'no-stage topology queues no impossible route');
+ok(lockMapSweep::initialize_or_reload(undef, { x => 2, y => 1 }),
+	'no-stage blocked state reloads through strict v6 validation');
+for (1 .. 3) { tick(); }
+is($route_attempts, $no_stage_routes, 'blocked no-stage retries remain bounded across repeated ticks');
+is(scalar keys %{read_state($no_stage_state)->{region_visit}}, 0,
+	'blocked no-stage retries never create region history');
 
 # Several destinations: use healthy alternatives first, retain the failed
 # obligation, then reconsider it after cooldown without double-crediting visits.
