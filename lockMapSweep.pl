@@ -18,6 +18,7 @@ use File::Path qw(make_path);
 use File::Temp qw(tempfile);
 use Digest::SHA qw(sha256_hex);
 use Storable qw(dclone);
+use Time::HiRes qw(time);
 
 Plugins::register('lockMapSweep', 'Smart lockMap block sweep randomWalk override', \&on_unload, \&on_unload);
 
@@ -34,6 +35,15 @@ my $hooks = Plugins::addHooks(
 my $cmd_hooks = Commands::register(
 	['lockMapSweep', 'Manage lockMapSweep state (status|rebuild|clearstate)', \&on_command_lock_map_sweep],
 );
+
+# Align travel-cost softmax to the same bound used for first-leg detours.
+my $MAX_REASONABLE_DETOUR = 24;
+my $GLOBAL_PLAN_TEMPERATURE = $MAX_REASONABLE_DETOUR;
+my $STRATEGIC_WAYPOINT_STEPS = 96;
+my $FAILED_TARGET_RETRY_INITIAL_SECONDS = 1;
+my $FAILED_TARGET_RETRY_MAX_SECONDS = 8;
+
+my $strategic_search_cache;
 
 my %state = (
 	ready => 0,
@@ -57,12 +67,24 @@ my %state = (
 	walk_min_y => 0,
 	walk_max_y => 0,
 	last_block => undef,
-	block_index_lookup => {},
-	destination_lookup => {},
+	destination_bitmap => '',
+	destination_cell_count => 0,
+	regions => [],
+	region_lookup => {},
+	region_index_map => '',
+	regions_by_block => {},
+	topology_built => 0,
+	block_visit_counts => {},
+	region_visit_history => {},
+	round_number => 1,
+	deferred_blocks => {},
+	same_cell_recovery => undef,
 	geometry_signature => '',
 		restriction_signature => '',
 	pending_target => undef,
 	failed_targets_by_block => {},
+	failed_target_retry_by_block => {},
+	failed_retry_after => 0,
 	failed_config_signature => undef,
 );
 
@@ -73,6 +95,12 @@ sub on_unload {
 }
 
 sub on_postloadfiles {
+	# Core files can load before OpenKore has an authoritative character map
+	# position. In that case map-change will build the topology with the correct
+	# origin; doing an origin-less full build here only to discard it duplicates
+	# the largest-component and region scans during startup.
+	return unless $char && $field && $config{lockMap}
+		&& $field->baseName eq $config{lockMap};
 	initialize_or_reload();
 }
 
@@ -167,15 +195,25 @@ sub on_ai_process_random_walk {
 			return;
 		}
 	}
-	my $origin = $char->{pos};
+	# OpenKore can leave pos at the start of its last movement packet after the
+	# server has already settled at pos_to. Plan from the settled endpoint so
+	# route estimates start at the confirmed current cell.
+	my $origin = $char->{pos_to} || $char->{pos};
 	if ($origin && defined $origin->{x} && defined $origin->{y}
 		&& !is_cell_reachable($origin->{x}, $origin->{y})) {
 		initialize_or_reload(undef, $origin);
+	}
+	if ($origin && $strategic_search_cache
+		&& $strategic_search_cache->{origin} ne "$origin->{x},$origin->{y}") {
+		$strategic_search_cache = undef;
 	}
 
 	if (!$state{ready}) {
 		warning "[lockMapSweep] State is not ready, falling back to default randomWalk.\n", 'system';
 		return;
+	}
+	if (release_failed_targets_if_due()) {
+		persist_state();
 	}
 
 	if ($state{pending_target}) {
@@ -189,22 +227,70 @@ sub on_ai_process_random_walk {
 		}
 	}
 
-	my $target = pick_target_in_current_plan();
+	my $target;
+	if ($state{same_cell_recovery}) {
+		if (failure_retry_wait_active()) {
+			diagnose_failed_target_exhaustion();
+			$args->{return} = 1;
+			return;
+		}
+		$target = resume_same_cell_recovery($origin);
+		if (!$target) {
+			$args->{return} = 1;
+			return;
+		}
+	} else {
+		$target = pick_target_in_current_plan();
+	}
 	if (!$target) {
-		warning "[lockMapSweep] Unable to find a valid target in planned blocks, falling back to default randomWalk.\n", 'system';
+		my $has_origin = $origin && defined $origin->{x} && defined $origin->{y};
+		my $origin_key = $has_origin ? "$origin->{x},$origin->{y}" : 'unknown';
+		my $origin_block = $has_origin ? coord_to_block_index($origin->{x}, $origin->{y}) : undef;
+		my $block = $state{bounds}->[$state{current_block}];
+		warning sprintf(
+			"[lockMapSweep] Unable to find a valid target (origin=%s reachable=%d originBlock=%s currentBlock=%d candidates=%d); falling back to default randomWalk.\n",
+			$origin_key,
+			is_cell_reachable($origin->{x}, $origin->{y}),
+			defined $origin_block ? $origin_block + 1 : 'none',
+			$state{current_block} + 1,
+			$block ? $block->{walkable_count} : 0,
+		), 'system';
+		if (failure_retry_wait_active()) {
+			diagnose_failed_target_exhaustion();
+			$args->{return} = 1;
+			return;
+		}
 		return;
+	}
+	if (!$target->{transit} && $origin
+		&& same_position({ x => $target->{x}, y => $target->{y} }, $origin)) {
+		$target = begin_same_cell_recovery($target, $origin);
+		unless ($target) {
+			$args->{return} = 1;
+			return;
+		}
 	}
 
 	my $attack_auto = Misc::getAttackAutoMode();
 	my $attack_on_route = (!defined $attack_auto || $attack_auto < 0) ? 0 : ($attack_auto >= 2 ? 2 : 1);
+	set_current_block($target->{block_idx});
 	$state{pending_target} = {
 		block_idx => $target->{block_idx},
+		region_key => $target->{region_key},
 		x => $target->{x},
 		y => $target->{y},
 		from_x => $target->{from_x},
 		from_y => $target->{from_y},
+		transit => $target->{transit} ? 1 : 0,
 	};
-	message sprintf("[lockMapSweep] Calculating sweep route to block %d: %d, %d\n", $target->{block_idx} + 1, $target->{x}, $target->{y}), 'route';
+	if ($target->{transit}) {
+		message sprintf("[lockMapSweep] Calculating strategic transit route to block %d: %d, %d toward region %s (goal cost %d, waypoint %d).\n",
+			$target->{block_idx} + 1, $target->{x}, $target->{y},
+			$target->{goal_region_key} || 'unknown', $target->{goal_cost} || 0,
+			$target->{waypoint_cost} || 0), 'route';
+	} else {
+		message sprintf("[lockMapSweep] Calculating sweep route to block %d: %d, %d\n", $target->{block_idx} + 1, $target->{x}, $target->{y}), 'route';
+	}
 	my $queued = eval {
 		ai_route(
 			$field->baseName,
@@ -220,6 +306,7 @@ sub on_ai_process_random_walk {
 	if (!$queued) {
 		my $error_text = $@ || 'unknown route creation error';
 		reject_pending_target("could not queue route: $error_text");
+		$args->{return} = 1;
 		return;
 	}
 	persist_state();
@@ -290,6 +377,132 @@ sub character_at_pending_target {
 	return actorFinishedMovement($char, $field, 0, 1) ? 1 : 0;
 }
 
+sub begin_same_cell_recovery {
+	my ($target, $origin) = @_;
+	my $recovery = {
+		phase => 'stage',
+		block_idx => $target->{block_idx},
+		x => $target->{x}, y => $target->{y},
+		region_key => $target->{region_key},
+		stage_x => -1, stage_y => -1,
+		retry_after => 0,
+		consecutive_failures => 0,
+	};
+	$state{same_cell_recovery} = $recovery;
+	return staging_target_from_recovery($recovery, $origin);
+}
+
+sub resume_same_cell_recovery {
+	my ($origin) = @_;
+	my $recovery = $state{same_cell_recovery} or return undef;
+	return undef unless $origin && defined $origin->{x} && defined $origin->{y};
+	return undef if ($recovery->{retry_after} || 0) > time();
+	if ($recovery->{phase} eq 'blocked') {
+		$recovery->{phase} = 'stage';
+	}
+	$recovery->{retry_after} = 0;
+	if ($recovery->{phase} eq 'stage') {
+		return staging_target_from_recovery($recovery, $origin);
+	}
+	return undef unless $recovery->{phase} eq 'return';
+	if (same_position($origin, { x => $recovery->{x}, y => $recovery->{y} })) {
+		$recovery->{phase} = 'stage';
+		$recovery->{stage_x} = -1;
+		$recovery->{stage_y} = -1;
+		return staging_target_from_recovery($recovery, $origin);
+	}
+	return undef unless actorFinishedMovement($char, $field, 0, 1);
+	return {
+		block_idx => $recovery->{block_idx}, region_key => $recovery->{region_key},
+		x => $recovery->{x}, y => $recovery->{y},
+		from_x => $origin->{x}, from_y => $origin->{y}, transit => 0,
+	};
+}
+
+sub staging_target_from_recovery {
+	my ($recovery, $origin) = @_;
+	my $stage = find_recovery_staging_cell($origin, $recovery);
+	unless ($stage) {
+		$recovery->{phase} = 'blocked';
+		$recovery->{stage_x} = -1;
+		$recovery->{stage_y} = -1;
+		$recovery->{retry_after} = schedule_recovery_retry($recovery);
+		my $idx = $recovery->{block_idx};
+		$state{deferred_blocks}{$idx} = {
+			remaining => remaining_block_visits($idx),
+			round => $state{round_number},
+			reason => "occupied-only coverage target has no reachable staging cell; retry after $recovery->{retry_after}",
+		};
+		warning sprintf("[lockMapSweep] Coverage blocked in block %d: the only pending destination is occupied and no legal staging cell is reachable; retry scheduled after %d.\n",
+			$idx + 1, $recovery->{retry_after}), 'route';
+		persist_state();
+		return undef;
+	}
+	$recovery->{phase} = 'stage';
+	$recovery->{stage_x} = $stage->{x};
+	$recovery->{stage_y} = $stage->{y};
+	$recovery->{retry_after} = 0;
+	delete $state{deferred_blocks}{$recovery->{block_idx}};
+	my $stage_region_id = region_id_at($stage->{x}, $stage->{y});
+	my $stage_region = defined $stage_region_id ? $state{regions}[$stage_region_id] : undef;
+	my $stage_block = coord_to_block_index($stage->{x}, $stage->{y});
+	return undef unless $stage_region && defined $stage_block;
+	return {
+		block_idx => $stage_block, region_key => $stage_region->{key},
+		x => $stage->{x}, y => $stage->{y},
+		from_x => $origin->{x}, from_y => $origin->{y},
+		transit => 1, recovery_stage => 1,
+		goal_region_key => $recovery->{region_key},
+		goal_cost => $stage->{cost}, waypoint_cost => $stage->{cost},
+	};
+}
+
+sub find_recovery_staging_cell {
+	my ($origin, $recovery) = @_;
+	return undef unless $origin && $field && is_cell_reachable($origin->{x}, $origin->{y});
+	my $max_steps = 8;
+	my ($costs) = cell_route_tree_from($origin, $max_steps, 0);
+	my @staging;
+	my $min_x = $origin->{x} - $max_steps;
+	my $max_x = $origin->{x} + $max_steps;
+	my $min_y = $origin->{y} - $max_steps;
+	my $max_y = $origin->{y} + $max_steps;
+	$min_x = 0 if $min_x < 0;
+	$min_y = 0 if $min_y < 0;
+	$max_x = $state{width} - 1 if $max_x >= $state{width};
+	$max_y = $state{height} - 1 if $max_y >= $state{height};
+	for my $y ($min_y .. $max_y) {
+		for my $x ($min_x .. $max_x) {
+			my $cost = $costs->{"$x,$y"};
+			next unless defined $cost && $cost > 0;
+			next if $x == $recovery->{x} && $y == $recovery->{y};
+			next unless is_cell_reachable($x, $y) && $field->isWalkable($x, $y);
+			push @staging, {
+				x => $x, y => $y, cost => $cost,
+				eligible => is_cell_eligible($x, $y) ? 1 : 0,
+			};
+		}
+	}
+	return undef unless @staging;
+	@staging = sort {
+		$a->{cost} <=> $b->{cost}
+		|| $a->{eligible} <=> $b->{eligible}
+		|| $a->{y} <=> $b->{y}
+		|| $a->{x} <=> $b->{x}
+	} @staging;
+	return $staging[0];
+}
+
+sub pending_is_recovery_stage {
+	my ($pending) = @_;
+	$pending ||= $state{pending_target};
+	return 0 unless $pending;
+	my $recovery = $state{same_cell_recovery} or return 0;
+	return 0 unless $recovery->{phase} eq 'stage' && $pending->{transit};
+	return $pending->{x} == $recovery->{stage_x}
+		&& $pending->{y} == $recovery->{stage_y};
+}
+
 sub character_moving_to_pending_target {
 	my $pending = $state{pending_target};
 	return 0 unless $pending && $char && $field;
@@ -307,28 +520,145 @@ sub complete_pending_target {
 		warning "[lockMapSweep] Ignoring arrival for a stale block plan.\n", 'system';
 		return 0;
 	}
+	if ($pending->{transit}) {
+		if (pending_is_recovery_stage($pending)) {
+			my $recovery = $state{same_cell_recovery};
+			unless (!same_position({ x => $pending->{x}, y => $pending->{y} },
+				{ x => $recovery->{x}, y => $recovery->{y} })) {
+				$state{same_cell_recovery} = undef;
+				return 0;
+			}
+			$recovery->{phase} = 'return';
+			$recovery->{retry_after} = 0;
+			$recovery->{consecutive_failures} = 0;
+			delete $state{deferred_blocks}{$recovery->{block_idx}};
+			persist_state();
+			message sprintf("[lockMapSweep] Reached staging position at %d, %d; no coverage visit credited, returning to %d, %d.\n",
+				$pending->{x}, $pending->{y}, $recovery->{x}, $recovery->{y}), 'route';
+			return 1;
+		}
+		clear_failed_target_retry($pending);
+		persist_state();
+		message sprintf("[lockMapSweep] Reached strategic transit waypoint at %d, %d; no block visit credited.\n",
+			$pending->{x}, $pending->{y}), 'route';
+		return 1;
+	}
 
 	my $key = block_key($block);
 	$state{used_targets_by_block}{$key} ||= {};
 	$state{used_targets_by_block}{$key}{"$pending->{x},$pending->{y}"} = 1;
+	$state{block_visit_counts}{$block_idx} = ($state{block_visit_counts}{$block_idx} || 0) + 1;
+	$state{region_visit_history}{$pending->{region_key}}++ if $pending->{region_key};
 	$state{last_target} = { x => $pending->{x}, y => $pending->{y} };
 	$state{last_block} = $block_idx;
+	clear_failed_target_retry($pending);
+	if (my $recovery = $state{same_cell_recovery}) {
+		$state{same_cell_recovery} = undef
+			if $recovery->{phase} eq 'return'
+				&& $pending->{block_idx} == $recovery->{block_idx}
+				&& $pending->{x} == $recovery->{x} && $pending->{y} == $recovery->{y};
+	}
+	set_current_block($block_idx);
+	$state{visited_blocks_in_cycle}{$block_idx} = 1
+		if remaining_block_visits($block_idx) <= 0;
 	advance_plan();
 	persist_state();
+	message sprintf("[lockMapSweep] Confirmed arrival at %d, %d in block %d.\n", $pending->{x}, $pending->{y}, $block_idx + 1), 'route';
 	return 1;
 }
 
 sub reject_pending_target {
 	my ($reason) = @_;
 	my $pending = delete $state{pending_target} or return 0;
+	if ($pending->{transit} && pending_is_recovery_stage($pending)) {
+		my $recovery = $state{same_cell_recovery};
+		$recovery->{phase} = 'blocked';
+		$recovery->{retry_after} = schedule_recovery_retry($recovery);
+		my $idx = $recovery->{block_idx};
+		$state{deferred_blocks}{$idx} = {
+			remaining => remaining_block_visits($idx),
+			round => $state{round_number},
+			reason => "staging route failed; occupied-only destination remains pending until retry after $recovery->{retry_after}",
+		};
+		persist_state() if $state{ready};
+		warning sprintf("[lockMapSweep] Staging route to %d, %d failed (%s); no visit credited and retry scheduled after %d.\n",
+			$pending->{x}, $pending->{y}, $reason || 'unknown route failure', $recovery->{retry_after}), 'route';
+		return 1;
+	}
+	my $retry_after = record_failed_target($pending);
+	if ($state{same_cell_recovery}
+		&& $state{same_cell_recovery}{phase} eq 'return'
+		&& $pending->{block_idx} == $state{same_cell_recovery}{block_idx}
+		&& $pending->{x} == $state{same_cell_recovery}{x}
+		&& $pending->{y} == $state{same_cell_recovery}{y}) {
+		$state{same_cell_recovery}{consecutive_failures} =
+			$state{failed_target_retry_by_block}{block_key($state{bounds}[$pending->{block_idx}])}{"$pending->{x},$pending->{y}"}{consecutive_failures};
+		$state{same_cell_recovery}{retry_after} = $retry_after;
+	}
+	$strategic_search_cache = undef;
+	persist_state() if $state{ready};
+	warning sprintf("[lockMapSweep] Route to %d, %d did not complete (%s); no visit was credited and retry is eligible after %d.\n",
+		$pending->{x}, $pending->{y}, $reason || 'unknown route failure', $retry_after), 'route';
+	return 1;
+}
+
+sub retry_delay_for_failures {
+	my ($failures) = @_;
+	$failures = 1 unless defined $failures && $failures > 0;
+	my $delay = $FAILED_TARGET_RETRY_INITIAL_SECONDS;
+	while ($failures > 1 && $delay < $FAILED_TARGET_RETRY_MAX_SECONDS) {
+		$delay *= 2;
+		$failures--;
+	}
+	return $delay > $FAILED_TARGET_RETRY_MAX_SECONDS
+		? $FAILED_TARGET_RETRY_MAX_SECONDS : $delay;
+}
+
+sub retry_deadline_after {
+	my ($delay) = @_;
+	my $deadline = time() + $delay;
+	my $whole = int($deadline);
+	return $whole < $deadline ? $whole + 1 : $whole;
+}
+
+sub record_failed_target {
+	my ($pending) = @_;
 	my $block = $state{bounds}->[$pending->{block_idx}];
 	my $key = $block ? block_key($block) : $pending->{block_idx};
+	my $coord = "$pending->{x},$pending->{y}";
 	$state{failed_targets_by_block}{$key} ||= {};
-	$state{failed_targets_by_block}{$key}{"$pending->{x},$pending->{y}"} = 1;
-	persist_state() if $state{ready};
-	warning sprintf("[lockMapSweep] Route to %d, %d did not complete (%s); progress was not advanced.\n",
-		$pending->{x}, $pending->{y}, $reason || 'unknown route failure'), 'route';
-	return 1;
+	$state{failed_target_retry_by_block}{$key} ||= {};
+	my $entry = $state{failed_target_retry_by_block}{$key}{$coord} || {};
+	my $failures = ($entry->{consecutive_failures} || 0) + 1;
+	$failures = 1_000_000 if $failures > 1_000_000;
+	my $retry_after = retry_deadline_after(retry_delay_for_failures($failures));
+	$state{failed_targets_by_block}{$key}{$coord} = 1;
+	$state{failed_target_retry_by_block}{$key}{$coord} = {
+		consecutive_failures => $failures,
+		retry_after => $retry_after,
+		transit => $pending->{transit} ? 1 : 0,
+	};
+	return $retry_after;
+}
+
+sub schedule_recovery_retry {
+	my ($recovery) = @_;
+	my $failures = ($recovery->{consecutive_failures} || 0) + 1;
+	$failures = 1_000_000 if $failures > 1_000_000;
+	$recovery->{consecutive_failures} = $failures;
+	return $recovery->{retry_after} = retry_deadline_after(retry_delay_for_failures($failures));
+}
+
+sub clear_failed_target_retry {
+	my ($pending) = @_;
+	return unless $pending;
+	my $block = $state{bounds}->[$pending->{block_idx}];
+	my $key = $block ? block_key($block) : $pending->{block_idx};
+	my $coord = "$pending->{x},$pending->{y}";
+	delete $state{failed_targets_by_block}{$key}{$coord}
+		if $state{failed_targets_by_block}{$key};
+	delete $state{failed_target_retry_by_block}{$key}{$coord}
+		if $state{failed_target_retry_by_block}{$key};
 }
 
 sub is_enabled {
@@ -367,14 +697,26 @@ sub initialize_or_reload {
 		walk_min_y => 0,
 		walk_max_y => 0,
 		last_block => undef,
-		block_index_lookup => {},
-		destination_lookup => {},
+		destination_bitmap => '',
+		destination_cell_count => 0,
+		regions => [],
+		region_lookup => {},
+		region_index_map => '',
+		regions_by_block => {},
+		topology_built => 0,
+		block_visit_counts => {},
+		region_visit_history => {},
+		round_number => 1,
+		deferred_blocks => {},
+		same_cell_recovery => undef,
 		geometry_signature => '',
 		restriction_signature => '',
 		pending_target => undef,
 		failed_targets_by_block => {},
+		failed_target_retry_by_block => {},
+		failed_retry_after => 0,
 		failed_config_signature => undef,
-	);
+		);
 	my $restore_previous = sub {
 		%state = %$previous if $previous->{ready};
 		return 0;
@@ -421,39 +763,61 @@ sub initialize_or_reload {
 			if $position && defined $position->{x} && defined $position->{y};
 	}
 	$state{reachable_lookup} = build_reachable_lookup($lock_field, $origin);
+	if ($origin) {
+		my $origin_key = "$origin->{x},$origin->{y}";
+		message sprintf(
+			"[lockMapSweep] Reachability origin=%s walkable=%d reachable=%d cells=%d.\n",
+			$origin_key,
+			$lock_field->isWalkable($origin->{x}, $origin->{y}) ? 1 : 0,
+			exists $state{reachable_lookup}{$origin_key} ? 1 : 0,
+			scalar keys %{$state{reachable_lookup}},
+		), 'plugin';
+	}
 	if (!%{$state{reachable_lookup}}) {
 		error "[lockMapSweep] No reachable walkable cells found on lockMap.\n";
 		return $restore_previous->();
 	}
 	$state{restriction_signature} = lock_restriction_signature();
-	$state{destination_lookup} = build_destination_lookup($lock_field);
-	if (!%{$state{destination_lookup}}) {
+	$state{destination_bitmap} = build_destination_lookup($lock_field);
+	if (!$state{destination_cell_count}) {
 		error "[lockMapSweep] No reachable cells satisfy lockMap coordinate restrictions.\n";
 		return $restore_previous->();
 	}
 	$state{geometry_signature} = map_geometry_signature($lock_field);
+	$strategic_search_cache = undef;
 
 	set_walkable_bounds_from_lookup();
-
-	my $loaded_state = !$force_rebuild && load_state_from_file();
-	if ($loaded_state) {
-		$state{ready} = 1;
-		build_block_index_lookup();
-		align_current_block_to_origin($origin);
-		persist_state();
-		message "[lockMapSweep] Loaded block plan from state file.\n", 'success';
-		return 1;
-	}
-
 	unless (build_block_plan($lock_field)) {
 		error "[lockMapSweep] Failed to build lockMap block plan.\n";
 		return $restore_previous->();
 	}
 
+	my $loaded_state = !$force_rebuild && load_state_from_file();
+	if ($loaded_state) {
+		$state{ready} = 1;
+		align_current_block_to_origin($origin);
+		persist_state();
+		message "[lockMapSweep] Loaded global coverage plan from state file.\n", 'success';
+		return 1;
+	}
+	if (!$force_rebuild && $state{state_file} && -f $state{state_file}) {
+		warning "[lockMapSweep] Saved coverage state is incompatible with current map geometry or settings; starting a new round.\n", 'system';
+	} elsif (!$force_rebuild && $state{state_file}) {
+		my $legacy_file = $state{state_file};
+		$legacy_file =~ s/_v6\.state$/_v5.state/;
+		my $older_file = $legacy_file;
+		$older_file =~ s/_v5\.state$/_v4.state/;
+		warning "[lockMapSweep] Version 4 state has block-only progress and cannot restore region coverage; starting a new round.\n", 'system'
+			if -f $older_file && !-f $legacy_file;
+	}
+
 	$state{ready} = 1;
 	$state{used_targets_by_block} = {};
 	$state{visited_blocks_in_cycle} = {};
-	build_block_index_lookup();
+	$state{block_visit_counts} = {};
+	$state{region_visit_history} = {};
+	$state{round_number} = 1;
+	$state{deferred_blocks} = {};
 	align_current_block_to_origin($origin);
 	persist_state();
 	message sprintf("[lockMapSweep] Built lockMap plan for %s (%dx%d blocks, %d cells per block).\n", $lock_map, $blocks_x, $blocks_y, $cells_per_block), 'success';
@@ -500,11 +864,11 @@ sub build_block_plan {
 			$max_x = $state{walk_max_x} if $bx == $state{blocks_x} - 1;
 			$max_y = $state{walk_max_y} if $by == $state{blocks_y} - 1;
 
-			my @target_cells;
+			my $eligible_count = 0;
 			for my $y ($min_y .. $max_y) {
 				for my $x ($min_x .. $max_x) {
 					next unless is_cell_eligible($x, $y);
-					push @target_cells, { x => $x, y => $y };
+					$eligible_count++;
 				}
 			}
 
@@ -513,19 +877,326 @@ sub build_block_plan {
 				max_x => $max_x,
 				min_y => $min_y,
 				max_y => $max_y,
-				walkable_count => scalar @target_cells,
-				target_cells => \@target_cells,
+				walkable_count => $eligible_count,
 			};
 		}
 	}
 
-	$state{current_block} = first_non_empty_block();
-	$state{visits_in_block} = 0;
+	$state{block_visit_counts} = {};
+	set_current_block(first_non_empty_block());
 	$state{used_targets_by_block} = {};
 	$state{visited_blocks_in_cycle} = {};
+	$state{region_visit_history} = {} unless ref($state{region_visit_history}) eq 'HASH';
+	$state{round_number} = 1 unless $state{round_number};
+	$state{deferred_blocks} = {};
 	$state{last_block} = undef;
-	build_block_index_lookup();
+	build_region_topology($lock_field);
 	return 1;
+}
+
+sub build_region_topology {
+	my ($lock_field) = @_;
+	return 0 unless $lock_field && $state{bounds} && @{$state{bounds}};
+	my $started = time();
+	my $reachable_count = scalar keys %{$state{reachable_lookup}};
+	my $topology = build_region_topology_for_grid(
+		$state{bounds},
+		sub { is_cell_reachable(@_) },
+		sub { is_cell_eligible(@_) },
+		sub { $lock_field->isWalkable(@_) },
+		sub { $lock_field->canMove(@_) },
+		sub { block_index_for_cell(@_) },
+	);
+	$state{regions} = $topology->{regions};
+	my $region_index_map = "\0" x ($state{width} * $state{height} * 4);
+	while (my ($key, $region_id) = each %{$topology->{region_lookup}}) {
+		my ($x, $y) = split /,/, $key, 2;
+	vec($region_index_map, $y * $state{width} + $x, 32) = $region_id + 1;
+	}
+	$state{region_index_map} = $region_index_map;
+	$state{region_lookup} = {};
+	$state{regions_by_block} = $topology->{regions_by_block};
+	$state{topology_built} = 1;
+	my $region_map_cells = 0;
+	my $region_target_cells = 0;
+	for my $region (@{$state{regions}}) {
+		$region_map_cells += $region->{cell_count} || 0;
+		$region_target_cells += $region->{eligible_count} || 0;
+	}
+	# Every reachable cell belongs to exactly one region. Keep the region map as
+	# the single post-build membership index instead of retaining a second large
+	# hash with the same coordinate keys and boolean values.
+	$state{reachable_lookup} = {};
+	message sprintf("[lockMapSweep] Region topology built regions=%d reachableCells=%d regionMapCells=%d eligibleDestinations=%d regionTargetCells=%d eligibilityBitmapBytes=%d weightedRouteCells=%d weightedEdges=%d elapsedMs=%.1f.\n",
+		scalar(@{$state{regions}}), $reachable_count, $region_map_cells, $state{destination_cell_count},
+		$region_target_cells, length($state{destination_bitmap} || ''), $topology->{weighted_route_cells} || 0,
+		$topology->{weighted_edge_count} || 0, (time() - $started) * 1000), 'plugin';
+	return scalar @{$state{regions}};
+}
+
+sub build_region_topology_for_grid {
+	my ($bounds, $is_reachable, $is_eligible, $is_walkable, $can_move, $block_index_for_cell) = @_;
+	return { regions => [], region_lookup => {}, regions_by_block => {} }
+		unless ref($bounds) eq 'ARRAY' && ref($is_reachable) eq 'CODE'
+			&& ref($is_eligible) eq 'CODE' && ref($is_walkable) eq 'CODE'
+			&& ref($can_move) eq 'CODE';
+	my @regions;
+	my %region_at;
+	my %regions_by_block;
+	my %block_at;
+	my %portal_cells;
+	my @directions = ([-1, 0], [1, 0], [0, -1], [0, 1],
+		[-1, -1], [1, -1], [-1, 1], [1, 1]);
+	if (ref($block_index_for_cell) ne 'CODE') {
+		for my $block_idx (0 .. $#$bounds) {
+			my $block = $bounds->[$block_idx];
+			next unless $block;
+			for my $y ($block->{min_y} .. $block->{max_y}) {
+				for my $x ($block->{min_x} .. $block->{max_x}) {
+					$block_at{"$x,$y"} = $block_idx;
+				}
+			}
+		}
+	}
+	my $block_for_cell = ref($block_index_for_cell) eq 'CODE'
+		? $block_index_for_cell
+		: sub { $block_at{"$_[0],$_[1]"} };
+
+	# First split each block into movement-connected components. Restriction-
+	# excluded walkable cells stay in the component graph because OpenKore may
+	# traverse them en route to an eligible destination.
+	for my $block_idx (0 .. $#$bounds) {
+		my $block = $bounds->[$block_idx];
+		next unless $block;
+		for my $y ($block->{min_y} .. $block->{max_y}) {
+			for my $x ($block->{min_x} .. $block->{max_x}) {
+				my $start_key = "$x,$y";
+				next unless $is_reachable->($x, $y) && !exists $region_at{$start_key};
+				my $region_id = scalar @regions;
+				my @queue = ({ x => $x, y => $y });
+				my $head = 0;
+				$region_at{$start_key} = $region_id;
+				my ($cell_count, $eligible_count, $sum_x, $sum_y) = (0, 0, 0, 0);
+				my @targets;
+				while ($head < @queue) {
+					my $pos = $queue[$head++];
+					$cell_count++;
+					$sum_x += $pos->{x};
+					$sum_y += $pos->{y};
+					my $pos_key = "$pos->{x},$pos->{y}";
+					if ($is_eligible->($pos->{x}, $pos->{y})) {
+						$eligible_count++;
+						push @targets, pack_region_target($pos->{x}, $pos->{y});
+					}
+					for my $d (@directions) {
+						my ($nx, $ny) = ($pos->{x} + $d->[0], $pos->{y} + $d->[1]);
+						my $next_key = "$nx,$ny";
+						next if exists $region_at{$next_key};
+						my $neighbor_block = $block_for_cell->($nx, $ny);
+						next unless defined($neighbor_block) && $neighbor_block == $block_idx;
+						next unless $is_reachable->($nx, $ny) && $is_walkable->($nx, $ny);
+						next unless $can_move->($pos, { x => $nx, y => $ny });
+						$region_at{$next_key} = $region_id;
+						push @queue, { x => $nx, y => $ny };
+					}
+				}
+				my $center_x = $sum_x / ($cell_count || 1);
+				my $center_y = $sum_y / ($cell_count || 1);
+			my ($representative, $representative_distance);
+			if (@targets) {
+				for my $target (@targets) {
+					my ($target_x, $target_y) = unpack_region_target($target);
+					my $distance = ($target_x - $center_x) ** 2 + ($target_y - $center_y) ** 2;
+					if (!defined($representative_distance) || $distance < $representative_distance) {
+						$representative = { x => $target_x, y => $target_y };
+						$representative_distance = $distance;
+					}
+				}
+			} else {
+				($representative) = sort {
+					(($a->{x} - $center_x) ** 2 + ($a->{y} - $center_y) ** 2)
+						<=> (($b->{x} - $center_x) ** 2 + ($b->{y} - $center_y) ** 2)
+				} @queue;
+			}
+				$regions[$region_id] = {
+					id => $region_id,
+					key => sprintf('%d:%s', $block_idx, $start_key),
+					block_idx => $block_idx,
+					cell_count => $cell_count,
+					eligible_count => $eligible_count,
+					target_cells => \@targets,
+					representative => { %$representative },
+					neighbors => {},
+					weighted_neighbors => {},
+				};
+				push @{$regions_by_block{$block_idx}}, $region_id;
+			}
+		}
+	}
+
+	# Build the global region graph from legal movement transitions. Paths that
+	# leave a block and later return are represented as ordinary graph paths
+	# through the intervening block regions.
+	my @transition_edges;
+	for my $key (keys %region_at) {
+		my ($x, $y) = split /,/, $key, 2;
+		my $from_id = $region_at{$key};
+		for my $d (@directions) {
+			my ($nx, $ny) = ($x + $d->[0], $y + $d->[1]);
+			my $to_key = "$nx,$ny";
+			next unless exists $region_at{$to_key};
+			my $to_id = $region_at{$to_key};
+			next if $from_id == $to_id;
+			next unless $can_move->({ x => $x, y => $y }, { x => $nx, y => $ny });
+			$regions[$from_id]{neighbors}{$to_id}++;
+			push @transition_edges, [$from_id, $key, $to_id, $to_key];
+			$portal_cells{$from_id}{$key} = 1;
+			$portal_cells{$to_id}{$to_key} = 1;
+		}
+	}
+
+	# Each component is searched once from its representative in each direction.
+	# Only distances to boundary portal cells survive, keeping the compressed
+	# weighted graph small while making continuation estimates movement-aware.
+	my (%portal_from_cost, %portal_to_cost);
+	my $weighted_route_cells = 0;
+	for my $region (@regions) {
+		my $id = $region->{id};
+		my $keys = $portal_cells{$id} || {};
+		next unless %$keys;
+		my ($forward, $forward_count) = region_local_portal_costs(
+			$region->{representative}, $id, \%region_at, $keys, $is_walkable, $can_move, 0);
+		my ($reverse, $reverse_count) = region_local_portal_costs(
+			$region->{representative}, $id, \%region_at, $keys, $is_walkable, $can_move, 1);
+		$weighted_route_cells += $forward_count + $reverse_count;
+		$portal_from_cost{$id} = $forward;
+		$portal_to_cost{$id} = $reverse;
+	}
+	for my $edge (@transition_edges) {
+		my ($from_id, $from_key, $to_id, $to_key) = @$edge;
+		my $from_cost = $portal_from_cost{$from_id}{$from_key};
+		my $to_cost = $portal_to_cost{$to_id}{$to_key};
+		next unless defined $from_cost && defined $to_cost;
+		my $cost = $from_cost + 1 + $to_cost;
+		my $old = $regions[$from_id]{weighted_neighbors}{$to_id};
+		$regions[$from_id]{weighted_neighbors}{$to_id} = $cost
+			if !defined($old) || $cost < $old;
+	}
+	my $weighted_edge_count = 0;
+	$weighted_edge_count += scalar keys %{$_->{weighted_neighbors}} for @regions;
+
+	return { regions => \@regions, region_lookup => \%region_at, regions_by_block => \%regions_by_block,
+		weighted_route_cells => $weighted_route_cells, weighted_edge_count => $weighted_edge_count };
+}
+
+sub region_local_portal_costs {
+	my ($origin, $region_id, $region_at, $portals, $is_walkable, $can_move, $reverse) = @_;
+	return ({}, 0) unless $origin && ref($region_at) eq 'HASH' && ref($portals) eq 'HASH';
+	my $origin_key = "$origin->{x},$origin->{y}";
+	my %costs = ($origin_key => 0);
+	my @queue = ({ x => $origin->{x}, y => $origin->{y} });
+	my $head = 0;
+	my %found;
+	while ($head < @queue) {
+		my $pos = $queue[$head++];
+		my $pos_key = "$pos->{x},$pos->{y}";
+		$found{$pos_key} = $costs{$pos_key} if $portals->{$pos_key};
+		for my $d ([-1,0], [1,0], [0,-1], [0,1], [-1,-1], [1,-1], [-1,1], [1,1]) {
+			my ($nx, $ny) = ($pos->{x} + $d->[0], $pos->{y} + $d->[1]);
+			my $next_key = "$nx,$ny";
+			next if exists $costs{$next_key};
+			next unless exists $region_at->{$next_key} && $region_at->{$next_key} == $region_id;
+			next unless $is_walkable->($nx, $ny);
+			my $can = $reverse
+				? $can_move->({x => $nx, y => $ny}, $pos)
+				: $can_move->($pos, {x => $nx, y => $ny});
+			next unless $can;
+			$costs{$next_key} = $costs{$pos_key} + 1;
+			push @queue, {x => $nx, y => $ny};
+		}
+	}
+	return (\%found, scalar @queue);
+}
+
+# Target cells are persisted in region topology as packed 16-bit x/y coordinates.
+# OpenKore field dimensions fit in this representation, and it avoids retaining
+# one Perl hash and several references for every eligible cell on large maps.
+sub pack_region_target {
+	my ($x, $y) = @_;
+	return (int($y) << 16) | int($x);
+}
+
+sub unpack_region_target {
+	my ($target) = @_;
+	return ($target->{x}, $target->{y}) if ref($target) eq 'HASH';
+	return (int($target) & 0xffff, int($target) >> 16);
+}
+
+sub calculate_region_selection_weights {
+	my ($regions, $confirmed_by_region, $candidate_ids) = @_;
+	$confirmed_by_region ||= {};
+	return [] unless ref($regions) eq 'ARRAY' && ref($confirmed_by_region) eq 'HASH';
+	my @active = grep { $_ && ($_->{eligible_count} || 0) > 0 } @$regions;
+	my $eligible_total = 0;
+	$eligible_total += $_->{eligible_count} for @active;
+	return [] unless $eligible_total > 0;
+
+	my $confirmed_total = 0;
+	for my $region (@active) {
+		my $key = defined $region->{key} ? $region->{key} : $region->{id};
+		my $count = $confirmed_by_region->{$key} || 0;
+		$confirmed_total += $count if $count > 0;
+	}
+	my $debt_scale = sqrt($confirmed_total + 1);
+	my $max_log_bias = log(3);
+	my @log_weights;
+	for my $region (@active) {
+		my $region_id = $region->{id};
+		next if $candidate_ids && !$candidate_ids->{$region_id};
+		my $key = defined $region->{key} ? $region->{key} : $region_id;
+		my $share = $region->{eligible_count} / $eligible_total;
+		my $confirmed = $confirmed_by_region->{$key} || 0;
+		my $debt = $confirmed_total * $share - $confirmed;
+		my $log_bias = $debt / $debt_scale;
+		$log_bias = $max_log_bias if $log_bias > $max_log_bias;
+		$log_bias = -$max_log_bias if $log_bias < -$max_log_bias;
+		push @log_weights, {
+			region_id => $region_id,
+			region_key => $key,
+			share => $share,
+			debt => $debt,
+			log_weight => log($share) + $log_bias,
+		};
+	}
+	return [] unless @log_weights;
+
+	# Log-sum-exp keeps tiny regions and large histories numerically stable.
+	my $max_log = $log_weights[0]{log_weight};
+	for my $item (@log_weights) {
+		$max_log = $item->{log_weight} if $item->{log_weight} > $max_log;
+	}
+	my $sum = 0;
+	for my $item (@log_weights) {
+		$item->{weight} = exp($item->{log_weight} - $max_log);
+		$sum += $item->{weight};
+	}
+	for my $item (@log_weights) {
+		$item->{probability} = $item->{weight} / $sum;
+	}
+	return \@log_weights;
+}
+
+sub sample_region_from_weights {
+	my ($weighted_regions, $roll) = @_;
+	return undef unless ref($weighted_regions) eq 'ARRAY' && @$weighted_regions;
+	$roll = rand() unless defined $roll;
+	return undef if $roll < 0 || $roll >= 1;
+	my $cumulative = 0;
+	for my $item (@$weighted_regions) {
+		$cumulative += $item->{probability};
+		return $item->{region_id} if $roll < $cumulative;
+	}
+	return $weighted_regions->[-1]{region_id};
 }
 
 sub set_walkable_bounds_from_lookup {
@@ -561,18 +1232,15 @@ sub first_non_empty_block {
 	return 0;
 }
 
-sub build_block_index_lookup {
-	$state{block_index_lookup} = {};
-	for my $idx (0 .. $#{$state{bounds}}) {
-		my $b = $state{bounds}->[$idx];
-		next unless $b;
-		for my $y ($b->{min_y} .. $b->{max_y}) {
-			for my $x ($b->{min_x} .. $b->{max_x}) {
-				next unless is_cell_reachable($x, $y);
-				$state{block_index_lookup}{"$x,$y"} = $idx;
-			}
-		}
-	}
+# The per-block table is authoritative. Keep the legacy current-block counter
+# synchronized whenever the selected block changes, and before persistence.
+sub set_current_block {
+	my ($block_idx) = @_;
+	return 0 unless defined $block_idx && $block_idx =~ /^\d+$/;
+	return 0 if $state{block_count} && $block_idx >= $state{block_count};
+	$state{current_block} = int($block_idx);
+	$state{visits_in_block} = $state{block_visit_counts}{$state{current_block}} || 0;
+	return 1;
 }
 
 sub align_current_block_to_origin {
@@ -582,8 +1250,7 @@ sub align_current_block_to_origin {
 	return unless defined $block_idx && $state{bounds}->[$block_idx]
 		&& $state{bounds}->[$block_idx]{walkable_count} > 0;
 	return if $block_idx == $state{current_block};
-	$state{current_block} = $block_idx;
-	$state{visits_in_block} = 0;
+	set_current_block($block_idx);
 	$state{last_block} = undef;
 	$state{last_target} = undef;
 }
@@ -649,18 +1316,21 @@ sub build_destination_lookup {
 	my $lock_y = defined($config{lockMap_y}) && $config{lockMap_y} ne '' ? $config{lockMap_y} : undef;
 	my $rand_x = positive_int_or_default($config{lockMap_randX}, 0);
 	my $rand_y = positive_int_or_default($config{lockMap_randY}, 0);
-	return {} if defined($lock_x) && $lock_x !~ /^-?\d+$/;
-	return {} if defined($lock_y) && $lock_y !~ /^-?\d+$/;
-	my %eligible;
+	return '' if defined($lock_x) && $lock_x !~ /^-?\d+$/;
+	return '' if defined($lock_y) && $lock_y !~ /^-?\d+$/;
+	my $eligible = "\0" x int(($field_width * $field_height + 7) / 8);
+	my $eligible_count = 0;
 	for my $key (keys %{$state{reachable_lookup}}) {
 		my ($x, $y) = split(/,/, $key, 2);
 		next if $x <= 0 || $y <= 0 || $x >= $field_width || $y >= $field_height;
 		next if defined($lock_x) && ($rand_x ? ($x < $lock_x - $rand_x || $x >= $lock_x + $rand_x) : $x != $lock_x);
 		next if defined($lock_y) && ($rand_y ? ($y < $lock_y - $rand_y || $y >= $lock_y + $rand_y) : $y != $lock_y);
 		next if $excluded{$x} && $excluded{$x}{$y};
-		$eligible{$key} = 1;
+		vec($eligible, $y * $field_width + $x, 1) = 1;
+		$eligible_count++;
 	}
-	return \%eligible;
+	$state{destination_cell_count} = $eligible_count;
+	return $eligible;
 }
 
 sub map_geometry_signature {
@@ -669,7 +1339,7 @@ sub map_geometry_signature {
 	$sha->add($lock_field->width . 'x' . $lock_field->height . ':');
 	$sha->add($lock_field->{rawMap} || '');
 	$sha->add(':' . lock_restriction_signature() . ':');
-	$sha->add(join(';', sort keys %{$state{destination_lookup}}));
+	$sha->add($state{destination_bitmap} || '');
 	return $sha->hexdigest;
 }
 
@@ -683,37 +1353,929 @@ sub block_key {
 	return sprintf('%d:%d:%d:%d', @{$block}{qw(min_x max_x min_y max_y)});
 }
 
+sub same_position {
+	my ($left, $right) = @_;
+	return 0 unless ref($left) eq 'HASH' && ref($right) eq 'HASH';
+	return defined($left->{x}) && defined($left->{y})
+		&& defined($right->{x}) && defined($right->{y})
+		&& $left->{x} == $right->{x} && $left->{y} == $right->{y};
+}
+
+sub filter_candidates_within_detour {
+	my ($candidates, $maximum_detour) = @_;
+	return [] unless ref($candidates) eq 'ARRAY' && @$candidates;
+	$maximum_detour = $MAX_REASONABLE_DETOUR
+		unless defined $maximum_detour && $maximum_detour >= 0;
+	my $best_arrival = (sort { $a <=> $b } map { $_->{arrival_cost} } @$candidates)[0];
+	return [grep { $_->{arrival_cost} <= $best_arrival + $maximum_detour } @$candidates];
+}
+
 sub is_cell_reachable {
 	my ($x, $y) = @_;
 	return 0 unless defined $x && defined $y;
+	return defined(region_id_at($x, $y)) ? 1 : 0 if $state{topology_built};
 	return exists $state{reachable_lookup}{"$x,$y"} ? 1 : 0;
+}
+
+sub region_id_at {
+	my ($x, $y) = @_;
+	return undef unless defined $x && defined $y && $x >= 0 && $y >= 0
+		&& $x < $state{width} && $y < $state{height};
+	my $encoded = vec($state{region_index_map}, $y * $state{width} + $x, 32);
+	return $encoded ? $encoded - 1 : undef;
 }
 
 sub is_cell_eligible {
 	my ($x, $y) = @_;
 	return 0 unless defined $x && defined $y;
-	return exists $state{destination_lookup}{"$x,$y"} ? 1 : 0;
+	return 0 if $x < 0 || $y < 0 || $x >= $state{width} || $y >= $state{height};
+	return vec($state{destination_bitmap}, $y * $state{width} + $x, 1) ? 1 : 0;
+}
+
+sub valid_failed_retry_cell {
+	my ($x, $y, $block, $transit) = @_;
+	return 0 unless defined $x && defined $y && $block;
+	return 0 unless within_block({ x => $x, y => $y }, $block);
+	return is_cell_eligible($x, $y) unless $transit;
+	return 0 unless $field && $field->isWalkable($x, $y);
+	return defined region_id_at($x, $y) ? 1 : 0;
 }
 
 sub pick_target_in_current_plan {
 	return undef unless $state{block_count} && $char && $field;
-	my $from = $char->{pos};
+	my $from = $char->{pos_to} || $char->{pos};
 	return undef unless $from && defined $from->{x} && defined $from->{y};
-	my %origin = (x => $from->{x}, y => $from->{y});
-	my $from_block = coord_to_block_index($origin{x}, $origin{y});
-	return undef unless defined $from_block;
+	return undef unless defined coord_to_block_index($from->{x}, $from->{y});
+	start_new_coverage_round() if coverage_round_is_complete();
+	return undef if failure_retry_wait_active();
 
-	for (1 .. $state{block_count}) {
-		my $block_idx = $state{current_block};
-		my $block = $state{bounds}->[$block_idx];
-		if ($block && $block->{walkable_count} > 0) {
-			my $target = pick_random_walkable_in_block($block_idx, $block, \%origin, $from_block);
-			return $target if $target;
+	my $decision_started = time();
+	my $goal_index_started = time();
+	my $local_goal_bitmap = build_local_goal_bitmap($from);
+	my $goal_index_ms = (time() - $goal_index_started) * 1000;
+	my ($local_started, $local_costs, $local_previous, $local_cells_examined) = (time(), undef, undef, 0);
+	($local_costs, $local_previous, $local_cells_examined) =
+		cell_route_tree_from($from, 128, 0, $local_goal_bitmap, $MAX_REASONABLE_DETOUR);
+	my $local_search_ms = (time() - $local_started) * 1000;
+	my $costs = $local_costs;
+	my @candidates;
+	my %available_by_block;
+	my %target_sets;
+	for my $region (@{$state{regions}}) {
+		my $block_idx = $region->{block_idx};
+		next unless remaining_block_visits($block_idx) > 0 && $region->{eligible_count} > 0;
+		my $block = $state{bounds}->[$block_idx] or next;
+		my $key = block_key($block);
+		$state{used_targets_by_block}{$key} ||= {};
+		$state{failed_targets_by_block}{$key} ||= {};
+		my @targets;
+		for my $target (@{$region->{target_cells} || []}) {
+			my ($target_x, $target_y) = unpack_region_target($target);
+			my $cell_key = "$target_x,$target_y";
+			next unless exists $costs->{$cell_key}
+				&& !$state{used_targets_by_block}{$key}{$cell_key}
+				&& !$state{failed_targets_by_block}{$key}{$cell_key}
+				&& !same_position({ x => $target_x, y => $target_y }, $from)
+				&& !same_position({ x => $target_x, y => $target_y }, $state{last_target});
+			push @targets, { x => $target_x, y => $target_y };
 		}
-		complete_empty_block($block_idx);
-		persist_state();
+		next unless @targets;
+		@targets = sort { $costs->{"$a->{x},$a->{y}"} <=> $costs->{"$b->{x},$b->{y}"} } @targets;
+		my $min_cost = $costs->{"$targets[0]{x},$targets[0]{y}"};
+		next if $min_cost > 128;
+		my @closest = grep { $costs->{"$_->{x},$_->{y}"} == $min_cost } @targets;
+		my $target = $closest[int(rand(@closest))];
+		my $candidate = {
+			region_id => $region->{id},
+			region_key => $region->{key},
+			block_idx => $block_idx,
+			region => $region,
+		x => $target->{x},
+		y => $target->{y},
+		arrival_cost => $min_cost,
+	};
+		push @candidates, $candidate;
+		push @{$available_by_block{$block_idx}}, $region;
+		$target_sets{$region->{id}} = scalar @targets;
 	}
-	return undef;
+	unless (@candidates) {
+		debug sprintf("[lockMapSweep] Local decision metrics expanded=%d predecessorMap=0 goalIndexMs=%.1f searchMs=%.1f totalMs=%.1f candidates=0 selection=strategic.\n",
+			$local_cells_examined || 0, $goal_index_ms, $local_search_ms,
+			(time() - $decision_started) * 1000), 'plugin', 2;
+		return select_strategic_transit_target($from, scalar keys %$costs);
+	}
+
+	# Coverage debt can affect an opportunity only inside the bounded detour window
+	# from the nearest remaining obligation, with a 128-step absolute cap.
+	my %locally_kept = map { $_->{region_id} => 1 }
+		@{filter_candidates_within_detour(\@candidates, $MAX_REASONABLE_DETOUR)};
+	my $best_local_arrival = (sort { $a <=> $b } map { $_->{arrival_cost} } @candidates)[0];
+	for my $candidate (@candidates) {
+		unless ($locally_kept{$candidate->{region_id}}) {
+			debug sprintf("[lockMapSweep] Candidate rejected block=%d region=%s arrival=%d bestArrival=%d reason=optional-detour-limit-%d.\n",
+				$candidate->{block_idx} + 1, $candidate->{region_key}, $candidate->{arrival_cost},
+				$best_local_arrival, $MAX_REASONABLE_DETOUR), 'plugin', 2;
+		}
+	}
+	@candidates = grep { $locally_kept{$_->{region_id}} } @candidates;
+	for my $candidate (@candidates) {
+		debug sprintf("[lockMapSweep] Candidate block=%d region=%s arrival=%d priorityPending=1 localDetourLimit=%d.\n",
+			$candidate->{block_idx} + 1, $candidate->{region_key}, $candidate->{arrival_cost},
+			$MAX_REASONABLE_DETOUR), 'plugin', 2;
+	}
+	my %opportunity_blocks = map { $_->{block_idx} => 1 } @candidates;
+	refresh_deferred_blocks(\%opportunity_blocks,
+		'outside the 24-step detour window from the nearest current opportunity');
+	my %probability_by_region;
+	for my $block_idx (keys %available_by_block) {
+		my @all_regions = @{$state{regions_by_block}{$block_idx} || []};
+		my @region_records = map { $state{regions}[$_] } @all_regions;
+		my %eligible_candidate = map { $_->{region_id} => 1 }
+			grep { $_->{block_idx} == $block_idx } @candidates;
+		my $weighted = calculate_region_selection_weights(
+			\@region_records, \%{$state{region_visit_history}}, \%eligible_candidate);
+		$probability_by_region{$_->{region_id}} = $_->{probability} for @$weighted;
+	}
+	my $planned_first = choose_global_plan_first_region(\@candidates, \%probability_by_region);
+	return undef unless defined $planned_first;
+	my ($candidate) = grep { $_->{region_id} == $planned_first } @candidates;
+	return undef unless $candidate;
+	debug sprintf("[lockMapSweep] Local decision metrics expanded=%d predecessorMap=0 goalIndexMs=%.1f searchMs=%.1f totalMs=%.1f candidates=%d selected=%s target=%d,%d origin=%d,%d estimatedArrival=%d.\n",
+		$local_cells_examined || 0, $goal_index_ms, $local_search_ms, (time() - $decision_started) * 1000,
+		scalar(@candidates), $candidate->{region_key}, $candidate->{x}, $candidate->{y},
+		$from->{x}, $from->{y}, $candidate->{arrival_cost}), 'plugin', 2;
+	return {
+		block_idx => $candidate->{block_idx},
+		region_key => $candidate->{region_key},
+		x => $candidate->{x},
+		y => $candidate->{y},
+		from_x => $from->{x},
+		from_y => $from->{y},
+	};
+}
+
+sub build_local_goal_bitmap {
+	my ($from) = @_;
+	my $bitmap = "\0" x int(($state{width} * $state{height} + 7) / 8);
+	for my $region (@{$state{regions}}) {
+		my $block_idx = $region->{block_idx};
+		next unless remaining_block_visits($block_idx) > 0;
+		my $block = $state{bounds}[$block_idx] or next;
+		my $key = block_key($block);
+		my $used = $state{used_targets_by_block}{$key} || {};
+		my $failed = $state{failed_targets_by_block}{$key} || {};
+		for my $target (@{$region->{target_cells} || []}) {
+			my ($target_x, $target_y) = unpack_region_target($target);
+			my $cell_key = "$target_x,$target_y";
+			next if $used->{$cell_key} || $failed->{$cell_key};
+			next if ($target_x == $from->{x} && $target_y == $from->{y})
+				|| ($state{last_target} && $target_x == $state{last_target}{x}
+					&& $target_y == $state{last_target}{y});
+			vec($bitmap, $target_y * $state{width} + $target_x, 1) = 1;
+		}
+	}
+	return $bitmap;
+}
+
+sub select_strategic_transit_target {
+	my ($from, $local_cells_examined) = @_;
+	my $started = time();
+	my $origin_key = "$from->{x},$from->{y}";
+	my $origin_region = region_id_at($from->{x}, $from->{y});
+	my @pending_regions = grep {
+		remaining_block_visits($_->{block_idx}) > 0 && ($_->{eligible_count} || 0) > 0
+	} @{$state{regions}};
+	my %pending_ids = map { $_->{id} => 1 } @pending_regions;
+	my $graph_hops = defined $origin_region
+		? region_graph_hops_from($origin_region, $state{regions}) : {};
+	my @graph_reachable = grep { exists $graph_hops->{$_->{id}} } @pending_regions;
+	my $pending_targets = 0;
+	for my $region (@pending_regions) {
+		my $block = $state{bounds}[$region->{block_idx}] or next;
+		my $key = block_key($block);
+		for my $cell (@{$region->{target_cells} || []}) {
+			my ($cell_x, $cell_y) = unpack_region_target($cell);
+			my $cell_key = "$cell_x,$cell_y";
+			$pending_targets++ unless $state{used_targets_by_block}{$key}{$cell_key}
+				|| $state{failed_targets_by_block}{$key}{$cell_key};
+		}
+	}
+	unless (@pending_regions && $pending_targets) {
+		my ($unused_targets, $failed_targets) = pending_target_availability();
+		if (!$unused_targets && $failed_targets) {
+			diagnose_failed_target_exhaustion();
+		} else {
+			refresh_deferred_blocks({}, 'no unused eligible targets remain for pending block quotas');
+		}
+		message sprintf("[lockMapSweep] Planning diagnosis: no usable pending destinations (pendingRegions=%d pendingTargets=%d localCells=%d elapsedMs=%.1f).\n",
+			scalar(@pending_regions), $pending_targets, $local_cells_examined || 0, (time() - $started) * 1000), 'route';
+		return undef;
+	}
+	unless (defined $origin_region && @graph_reachable) {
+		my $reason = defined $origin_region
+			? 'pending regions are disconnected in the region graph'
+			: 'current position is missing from the region graph';
+		refresh_deferred_blocks({}, $reason);
+		message sprintf("[lockMapSweep] Planning diagnosis: region graph disconnected (originRegion=%s pendingRegions=%d graphReachable=%d pendingTargets=%d).\n",
+			defined $origin_region ? $origin_region : 'none', scalar(@pending_regions), scalar(@graph_reachable), $pending_targets), 'route';
+		return undef;
+	}
+
+	my $cache = $strategic_search_cache;
+	my $cache_reused = $cache && $cache->{origin} eq $origin_key
+		&& $cache->{geometry} eq $state{geometry_signature};
+	if (!$cache_reused) {
+		my $search_started = time();
+		my ($costs, $previous, $expanded) = cell_route_tree_compact_from($from);
+		$cache = {
+			origin => $origin_key,
+			geometry => $state{geometry_signature},
+			costs => $costs,
+			previous => $previous,
+			expanded => $expanded,
+		};
+		$strategic_search_cache = $cache;
+		debug sprintf("[lockMapSweep] Strategic route tree cache=miss origin=%s costEntries=%d predecessorEntries=%d costBytes=%d predecessorBytes=%d elapsedMs=%.1f.\n",
+			$origin_key, $expanded, $expanded > 0 ? $expanded - 1 : 0,
+			length(${$cache->{costs}}), length(${$cache->{previous}}),
+			(time() - $search_started) * 1000), 'plugin', 2;
+	} else {
+		debug sprintf("[lockMapSweep] Strategic route tree cache=hit origin=%s costEntries=%d predecessorEntries=%d costBytes=%d predecessorBytes=%d.\n",
+			$origin_key, $cache->{expanded}, $cache->{expanded} > 0 ? $cache->{expanded} - 1 : 0,
+			length(${$cache->{costs}}), length(${$cache->{previous}})), 'plugin', 2;
+	}
+	my ($costs, $previous) = @{$cache}{qw(costs previous)};
+	my $has_reachable_alternative = 0;
+	REGION: for my $region (@pending_regions) {
+		my $block = $state{bounds}[$region->{block_idx}] or next;
+		my $key = block_key($block);
+		for my $target (@{$region->{target_cells} || []}) {
+			my ($target_x, $target_y) = unpack_region_target($target);
+			my $cell_key = "$target_x,$target_y";
+			next if $state{used_targets_by_block}{$key}{$cell_key}
+				|| $state{failed_targets_by_block}{$key}{$cell_key}
+				|| same_position({ x => $target_x, y => $target_y }, $from);
+			if (defined route_cost_at($costs, $target_x, $target_y)) {
+				$has_reachable_alternative = 1;
+				last REGION;
+			}
+		}
+	}
+	my @global_candidates;
+	my %probability_by_region;
+	my %target_sets;
+	for my $region (@pending_regions) {
+		my $block = $state{bounds}[$region->{block_idx}] or next;
+		my $key = block_key($block);
+		my ($min_cost, @closest);
+		my $available = 0;
+		for my $target (@{$region->{target_cells} || []}) {
+			my ($target_x, $target_y) = unpack_region_target($target);
+			my $cell_key = "$target_x,$target_y";
+			next if $has_reachable_alternative
+				&& same_position({ x => $target_x, y => $target_y }, $from);
+			next if $state{used_targets_by_block}{$key}{$cell_key}
+				|| $state{failed_targets_by_block}{$key}{$cell_key};
+			my $cost = route_cost_at($costs, $target_x, $target_y);
+			next unless defined $cost;
+			$available++;
+			if (!defined $min_cost || $cost < $min_cost) {
+				$min_cost = $cost;
+				@closest = ({ x => $target_x, y => $target_y });
+			} elsif ($cost == $min_cost) {
+				push @closest, { x => $target_x, y => $target_y };
+			}
+		}
+		$target_sets{$region->{id}} = $available;
+		next unless defined $min_cost && @closest;
+		my $target = $closest[int(rand(@closest))];
+		push @global_candidates, {
+			region_id => $region->{id}, region_key => $region->{key},
+			block_idx => $region->{block_idx}, region => $region,
+			x => $target->{x}, y => $target->{y}, arrival_cost => $min_cost,
+		};
+	}
+	unless (@global_candidates) {
+		my $reason = @graph_reachable
+			? 'globally reachable topology has no route-cost path to any pending destination'
+			: 'pending destinations are unreachable from the current region';
+		refresh_deferred_blocks({}, $reason);
+		message sprintf("[lockMapSweep] Planning diagnosis: %s (pendingRegions=%d graphReachable=%d searchExpanded=%d localCells=%d elapsedMs=%.1f).\n",
+			$reason, scalar(@pending_regions), scalar(@graph_reachable), $cache->{expanded},
+			$local_cells_examined || 0, (time() - $started) * 1000), 'route';
+		return undef;
+	}
+
+	my %eligible_ids = map { $_->{region_id} => 1 } @global_candidates;
+	for my $block_idx (keys %{$state{regions_by_block}}) {
+		my @records = map { $state{regions}[$_] } @{$state{regions_by_block}{$block_idx}};
+		my $weighted = calculate_region_selection_weights(
+			\@records, \%{$state{region_visit_history}}, \%eligible_ids);
+		$probability_by_region{$_->{region_id}} = $_->{probability} for @$weighted;
+	}
+	my $planned_region = choose_global_plan_first_region(
+		\@global_candidates, \%probability_by_region);
+	my ($goal) = grep { $_->{region_id} == $planned_region } @global_candidates;
+	unless ($goal) {
+		message "[lockMapSweep] Planning diagnosis: global lookahead returned no first region.\n", 'route';
+		return undef;
+	}
+	if (same_position({ x => $goal->{x}, y => $goal->{y} }, $from)) {
+		return {
+			block_idx => $goal->{block_idx}, region_key => $goal->{region_key},
+			x => $goal->{x}, y => $goal->{y},
+			from_x => $from->{x}, from_y => $from->{y}, transit => 0,
+		};
+	}
+	my $path = reconstruct_cell_path($origin_key, "$goal->{x},$goal->{y}", $previous);
+	unless (ref($path) eq 'ARRAY' && @$path > 1 && @$path == $goal->{arrival_cost} + 1) {
+		refresh_deferred_blocks({}, 'route-search tree could not reconstruct a path to a connected pending region');
+		message sprintf("[lockMapSweep] Planning diagnosis: local search exhausted and global route reconstruction failed (goal=%s cost=%d).\n",
+			$goal->{region_key}, $goal->{arrival_cost}), 'route';
+		return undef;
+	}
+	my $max_index = $goal->{arrival_cost} < 128 ? $goal->{arrival_cost} : 128;
+	my $waypoint_index;
+	for my $i (1 .. $max_index) {
+		my ($x, $y) = @{$path->[$i]};
+		my $block_idx = coord_to_block_index($x, $y);
+		my $block = defined $block_idx ? $state{bounds}[$block_idx] : undef;
+		my $failed = $block
+			&& $state{failed_targets_by_block}{block_key($block)}{"$x,$y"};
+		if (is_cell_eligible($x, $y) && !$failed
+			&& !same_position({x => $x, y => $y}, $from)) {
+			$waypoint_index = $i;
+		}
+	}
+	unless (defined $waypoint_index) {
+		refresh_deferred_blocks({}, 'no legal lockMap destination exists within the bounded strategic waypoint horizon');
+		message sprintf("[lockMapSweep] Planning diagnosis: no eligible waypoint within 128 steps (goal=%s goalCost=%d searchExpanded=%d).\n",
+			$goal->{region_key}, $goal->{arrival_cost}, $cache->{expanded}), 'route';
+		return undef;
+	}
+	my ($way_x, $way_y) = @{$path->[$waypoint_index]};
+	my $way_key = "$way_x,$way_y";
+	my $way_region_id = region_id_at($way_x, $way_y);
+	my $way_region = defined $way_region_id ? $state{regions}[$way_region_id] : undef;
+	my $goal_probability = $probability_by_region{$goal->{region_id}} || 0;
+	my $local_reachable_count = scalar grep {
+		$_->{arrival_cost} <= 128
+	} @global_candidates;
+	refresh_deferred_blocks({}, 'pending obligation is globally connected but requires bounded strategic transit');
+	message sprintf("[lockMapSweep] Strategic plan diagnosis: pending-region travel selected (origin=%s goal=%s estimatedArrival=%d waypoint=%d localPendingRegions=%d pendingRegions=%d graphReachable=%d searchExpanded=%d elapsedMs=%.1f).\n",
+		$origin_key, $goal->{region_key}, $goal->{arrival_cost}, $waypoint_index,
+		$local_reachable_count, scalar(@pending_regions), scalar(@graph_reachable),
+		$cache->{expanded}, (time() - $started) * 1000), 'route';
+	for my $candidate (sort { $a->{arrival_cost} <=> $b->{arrival_cost} } @global_candidates) {
+		debug sprintf("[lockMapSweep] Candidate block=%d region=%s arrival=%d priority=%.6f availableTargets=%d selection=global-obligation\n",
+			$candidate->{block_idx} + 1, $candidate->{region_key}, $candidate->{arrival_cost},
+			$probability_by_region{$candidate->{region_id}} || 0,
+			$target_sets{$candidate->{region_id}} || 0), 'plugin', 2;
+	}
+	return {
+		block_idx => $way_region ? $way_region->{block_idx} : $goal->{block_idx},
+		region_key => $way_region ? $way_region->{key} : $goal->{region_key},
+		x => $way_x, y => $way_y,
+		from_x => $from->{x}, from_y => $from->{y},
+		transit => 1,
+		goal_region_key => $goal->{region_key},
+		goal_cost => $goal->{arrival_cost},
+		waypoint_cost => $waypoint_index,
+	};
+}
+
+sub refresh_deferred_blocks {
+	my ($opportunities, $reason) = @_;
+	my $changed = 0;
+	for my $idx (0 .. $#{$state{bounds}}) {
+		my $remaining = remaining_block_visits($idx);
+		next unless $remaining > 0;
+		if ($opportunities->{$idx}) {
+			$changed = 1 if delete $state{deferred_blocks}{$idx};
+			next;
+		}
+		next if $state{deferred_blocks}{$idx};
+		$state{deferred_blocks}{$idx} = {
+			remaining => $remaining,
+			round => $state{round_number},
+			reason => $reason,
+		};
+		warning sprintf("[lockMapSweep] Deferring block %d with %d remaining visits: %s.\n",
+			$idx + 1, $remaining, $reason), 'route';
+		$changed = 1;
+	}
+	persist_state() if $changed && $state{ready};
+}
+
+sub pending_target_availability {
+	my ($unused, $failed) = (0, 0);
+	my $now = time();
+	for my $region (@{$state{regions}}) {
+		my $block_idx = $region->{block_idx};
+		next unless remaining_block_visits($block_idx) > 0;
+		my $block = $state{bounds}[$block_idx] or next;
+		my $key = block_key($block);
+		my $used = $state{used_targets_by_block}{$key} || {};
+		my $blocked = $state{failed_targets_by_block}{$key} || {};
+		for my $packed (@{$region->{target_cells} || []}) {
+			my ($x, $y) = unpack_region_target($packed);
+			my $cell = "$x,$y";
+			next if $used->{$cell};
+			my $retry = $state{failed_target_retry_by_block}{$key}{$cell};
+			if (exists $blocked->{$cell} && $retry && $retry->{retry_after} > $now) {
+				$failed++;
+			} else {
+				$unused++;
+			}
+		}
+	}
+	return ($unused, $failed);
+}
+
+sub failure_retry_wait_active {
+	my ($unused, $failed) = pending_target_availability();
+	return 0 if $unused;
+	return 0 unless $failed;
+	my $retry_after = earliest_pending_retry_after();
+	return defined $retry_after && $retry_after > time() ? 1 : 0;
+}
+
+sub release_failed_targets_if_due {
+	my $now = time();
+	my $released = 0;
+	for my $key (keys %{$state{failed_targets_by_block} || {}}) {
+		my $targets = $state{failed_targets_by_block}{$key} || {};
+		for my $coord (keys %$targets) {
+			my $retry = $state{failed_target_retry_by_block}{$key}{$coord};
+			if (!$retry || $retry->{retry_after} <= $now) {
+				delete $targets->{$coord};
+				$released++;
+			}
+		}
+		delete $state{failed_targets_by_block}{$key} unless keys %$targets;
+	}
+	return 0 unless $released;
+	$state{failed_retry_after} = 0;
+	$strategic_search_cache = undef;
+	for my $idx (keys %{$state{deferred_blocks}}) {
+		delete $state{deferred_blocks}{$idx}
+			if ($state{deferred_blocks}{$idx}{reason} || '') =~ /all remaining destinations failed/;
+	}
+	message sprintf("[lockMapSweep] %d failed destination(s) are eligible for a controlled retry; coverage quotas remain pending.\n", $released), 'route';
+	return 1;
+}
+
+sub diagnose_failed_target_exhaustion {
+	my $retry_after = earliest_pending_retry_after() || retry_deadline_after($FAILED_TARGET_RETRY_INITIAL_SECONDS);
+	my $reason = "all remaining destinations failed; coverage is blocked until retry at $retry_after";
+	my $changed = 0;
+	for my $idx (0 .. $#{$state{bounds}}) {
+		my $remaining = remaining_block_visits($idx);
+		next unless $remaining > 0;
+		my $old = $state{deferred_blocks}{$idx};
+		next if $old && ($old->{reason} || '') eq $reason
+			&& $old->{remaining} == $remaining && $old->{round} == $state{round_number};
+		$state{deferred_blocks}{$idx} = {
+			remaining => $remaining,
+			round => $state{round_number},
+			reason => $reason,
+		};
+		$changed = 1;
+	}
+	warning "[lockMapSweep] Coverage blocked: every unused destination has a failed route; quotas are retained and retry is scheduled after $retry_after.\n", 'route'
+		if $changed;
+	persist_state() if $changed && $state{ready};
+}
+
+sub earliest_pending_retry_after {
+	my $earliest;
+	for my $region (@{$state{regions} || []}) {
+		my $idx = $region->{block_idx};
+		next unless remaining_block_visits($idx) > 0;
+		my $block = $state{bounds}[$idx] or next;
+		my $key = block_key($block);
+		my $used = $state{used_targets_by_block}{$key} || {};
+		for my $packed (@{$region->{target_cells} || []}) {
+			my ($x, $y) = unpack_region_target($packed);
+			my $coord = "$x,$y";
+			next if $used->{$coord};
+			next unless exists $state{failed_targets_by_block}{$key}{$coord};
+			my $retry = $state{failed_target_retry_by_block}{$key}{$coord} or next;
+			$earliest = $retry->{retry_after}
+				if !defined $earliest || $retry->{retry_after} < $earliest;
+		}
+	}
+	return $earliest;
+}
+
+sub block_visit_quota {
+	my ($block_idx) = @_;
+	my $block = $state{bounds}->[$block_idx] or return 0;
+	my $eligible = $block->{walkable_count} || 0;
+	return $eligible < $state{cells_per_block} ? $eligible : $state{cells_per_block};
+}
+
+sub remaining_block_visits {
+	my ($block_idx) = @_;
+	my $remaining = block_visit_quota($block_idx) - ($state{block_visit_counts}{$block_idx} || 0);
+	return $remaining > 0 ? $remaining : 0;
+}
+
+sub coverage_round_is_complete {
+	for my $idx (0 .. $#{$state{bounds}}) {
+		return 0 if block_visit_quota($idx) && remaining_block_visits($idx) > 0;
+	}
+	return 1;
+}
+
+sub start_new_coverage_round {
+	$state{round_number}++;
+	$state{block_visit_counts} = {};
+	$state{same_cell_recovery} = undef;
+	set_current_block($state{current_block});
+	$state{failed_retry_after} = 0;
+	$state{visited_blocks_in_cycle} = {};
+	$state{used_targets_by_block} = {};
+	$state{failed_targets_by_block} = {};
+	$state{failed_target_retry_by_block} = {};
+	$state{deferred_blocks} = {};
+	$state{last_block} = undef;
+}
+
+sub cell_route_costs_from {
+	my ($origin, $max_cost) = @_;
+	my ($costs) = cell_route_tree_from($origin, $max_cost, 0);
+	return $costs;
+}
+
+sub cell_route_tree_from {
+	my ($origin, $max_cost, $track_previous, $goal_bitmap, $goal_detour) = @_;
+	$track_previous = 1 unless defined $track_previous;
+	my %costs = ("$origin->{x},$origin->{y}" => 0);
+	my $previous = $track_previous ? {} : undef;
+	my $search_limit = $max_cost;
+	my $nearest_goal_cost;
+	my @queue = ({ x => $origin->{x}, y => $origin->{y} });
+	my $head = 0;
+	my @directions = ([-1, 0], [1, 0], [0, -1], [0, 1],
+		[-1, -1], [1, -1], [-1, 1], [1, 1]);
+	while ($head < @queue) {
+		my $pos = $queue[$head++];
+		my $next_cost = $costs{"$pos->{x},$pos->{y}"} + 1;
+		last if defined $search_limit && $next_cost > $search_limit;
+		for my $d (@directions) {
+			my ($nx, $ny) = ($pos->{x} + $d->[0], $pos->{y} + $d->[1]);
+			my $key = "$nx,$ny";
+			next if exists $costs{$key};
+			next unless is_cell_reachable($nx, $ny) && $field->isWalkable($nx, $ny);
+			next unless $field->canMove($pos, { x => $nx, y => $ny });
+			$costs{$key} = $next_cost;
+			$previous->{$key} = "$pos->{x},$pos->{y}" if $track_previous;
+			if (defined($goal_bitmap) && length($goal_bitmap)
+				&& vec($goal_bitmap, $ny * $state{width} + $nx, 1)) {
+				if (!defined $nearest_goal_cost) {
+					$nearest_goal_cost = $next_cost;
+					my $goal_limit = $next_cost + ($goal_detour || 0);
+					$search_limit = $goal_limit
+						if !defined($search_limit) || $goal_limit < $search_limit;
+				}
+			}
+			push @queue, { x => $nx, y => $ny };
+		}
+	}
+	return (\%costs, $previous, scalar @queue);
+}
+
+sub cell_route_tree_compact_from {
+	my ($origin) = @_;
+	my $width = $state{width};
+	my $height = $state{height};
+	my $cell_count = $width * $height;
+	my $costs = "\0" x ($cell_count * 4);
+	my $previous = "\0" x int(($cell_count + 1) / 2);
+	my $origin_index = $origin->{y} * $width + $origin->{x};
+	vec($costs, $origin_index, 32) = 1;
+	my @queue = ($origin_index);
+	my $head = 0;
+	my @directions = ([-1, 0], [1, 0], [0, -1], [0, 1],
+		[-1, -1], [1, -1], [-1, 1], [1, 1]);
+	my @opposite_direction = (1, 0, 3, 2, 7, 6, 5, 4);
+	while ($head < @queue) {
+		my $index = $queue[$head++];
+		my $x = $index % $width;
+		my $y = int($index / $width);
+		my $pos = { x => $x, y => $y };
+		my $next_cost = vec($costs, $index, 32);
+		for my $direction_index (0 .. $#directions) {
+			my ($dx, $dy) = @{$directions[$direction_index]};
+			my ($nx, $ny) = ($x + $dx, $y + $dy);
+			next if $nx < 0 || $ny < 0 || $nx >= $width || $ny >= $height;
+			my $next_index = $ny * $width + $nx;
+			next if vec($costs, $next_index, 32);
+			next unless is_cell_reachable($nx, $ny) && $field->isWalkable($nx, $ny);
+			next unless $field->canMove($pos, { x => $nx, y => $ny });
+			vec($costs, $next_index, 32) = $next_cost + 1;
+			vec($previous, $next_index, 4) = $opposite_direction[$direction_index];
+			push @queue, $next_index;
+		}
+	}
+	return (\$costs, \$previous, scalar @queue);
+}
+
+sub route_cost_at {
+	my ($costs, $x, $y) = @_;
+	return undef unless defined $costs && defined $x && defined $y;
+	if (ref($costs) eq 'SCALAR') {
+		return undef if $x < 0 || $y < 0 || $x >= $state{width} || $y >= $state{height};
+		my $encoded = vec($$costs, $y * $state{width} + $x, 32);
+		return $encoded ? $encoded - 1 : undef;
+	}
+	return undef unless ref($costs) eq 'HASH';
+	my $key = "$x,$y";
+	return exists $costs->{$key} ? $costs->{$key} : undef;
+}
+
+sub reconstruct_cell_path {
+	my ($origin_key, $destination_key, $previous) = @_;
+	return () unless defined $origin_key && defined $destination_key;
+	return reconstruct_compact_cell_path($origin_key, $destination_key, $previous)
+		if ref($previous) eq 'SCALAR';
+	return () unless ref($previous) eq 'HASH';
+	my @reverse = ($destination_key);
+	my $key = $destination_key;
+	my %seen = ($key => 1);
+	while ($key ne $origin_key) {
+		$key = $previous->{$key};
+		return () unless defined $key && !$seen{$key}++;
+		push @reverse, $key;
+	}
+	return [map { [split /,/, $_, 2] } reverse @reverse];
+}
+
+sub reconstruct_compact_cell_path {
+	my ($origin_key, $destination_key, $previous) = @_;
+	my ($origin_x, $origin_y) = split /,/, $origin_key, 2;
+	my ($x, $y) = split /,/, $destination_key, 2;
+	my @reverse = ([int($x), int($y)]);
+	my $origin_index = $origin_y * $state{width} + $origin_x;
+	my $index = $y * $state{width} + $x;
+	my $steps = 0;
+	my @directions = ([-1, 0], [1, 0], [0, -1], [0, 1],
+		[-1, -1], [1, -1], [-1, 1], [1, 1]);
+	while ($index != $origin_index) {
+		return () if ++$steps > $state{width} * $state{height};
+		my $direction_index = vec($$previous, $index, 4);
+		return () if $direction_index > $#directions;
+		$x += $directions[$direction_index][0];
+		$y += $directions[$direction_index][1];
+		return () if $x < 0 || $y < 0 || $x >= $state{width} || $y >= $state{height};
+		$index = $y * $state{width} + $x;
+		push @reverse, [int($x), int($y)];
+	}
+	return [reverse @reverse];
+}
+
+sub region_graph_hops_from {
+	my ($start_region_id, $regions) = @_;
+	$regions ||= $state{regions};
+	my %hops = ($start_region_id => 0);
+	my @queue = ($start_region_id);
+	my $head = 0;
+	while ($head < @queue) {
+		my $region_id = $queue[$head++];
+		my $region = $regions->[$region_id] or next;
+		for my $neighbor (keys %{$region->{neighbors} || {}}) {
+			next if exists $hops{$neighbor};
+			$hops{$neighbor} = $hops{$region_id} + 1;
+			push @queue, $neighbor;
+		}
+	}
+	return \%hops;
+}
+
+sub region_graph_costs_from {
+	my ($start_region_id, $regions) = @_;
+	$regions ||= $state{regions};
+	return {} unless ref($regions) eq 'ARRAY' && $regions->[$start_region_id];
+	my %costs = ($start_region_id => 0);
+	my @heap = ([0, $start_region_id]);
+	while (@heap) {
+		my ($cost, $id) = heap_pop_min(\@heap);
+		next if $costs{$id} < $cost;
+		my $region = $regions->[$id] or next;
+		for my $neighbor (keys %{$region->{weighted_neighbors} || {}}) {
+			my $next_cost = $cost + $region->{weighted_neighbors}{$neighbor};
+			next if defined $costs{$neighbor} && $costs{$neighbor} <= $next_cost;
+			$costs{$neighbor} = $next_cost;
+			heap_push_min(\@heap, [$next_cost, $neighbor]);
+		}
+	}
+	return \%costs;
+}
+
+sub heap_push_min {
+	my ($heap, $item) = @_;
+	push @$heap, $item;
+	my $index = $#$heap;
+	while ($index > 0) {
+		my $parent = int(($index - 1) / 2);
+		last if $heap->[$parent][0] <= $item->[0];
+		$heap->[$index] = $heap->[$parent];
+		$index = $parent;
+	}
+	$heap->[$index] = $item;
+}
+
+sub heap_pop_min {
+	my ($heap) = @_;
+	my $minimum = $heap->[0];
+	my $last = pop @$heap;
+	if (@$heap) {
+		my $index = 0;
+		while (1) {
+			my $left = 2 * $index + 1;
+			last if $left > $#$heap;
+			my $right = $left + 1;
+			my $child = $right <= $#$heap && $heap->[$right][0] < $heap->[$left][0]
+				? $right : $left;
+			last if $heap->[$child][0] >= $last->[0];
+			$heap->[$index] = $heap->[$child];
+			$index = $child;
+		}
+		$heap->[$index] = $last;
+	}
+	return @$minimum;
+}
+
+sub choose_global_plan_first_region {
+	my ($first_candidates, $first_probabilities) = @_;
+	return undef unless @$first_candidates;
+	my (%block_remaining, %target_remaining, %probability);
+	for my $candidate (@$first_candidates) {
+		$probability{$candidate->{region_id}} = $first_probabilities->{$candidate->{region_id}} || 0;
+	}
+	for my $idx (0 .. $#{$state{bounds}}) {
+		$block_remaining{$idx} = remaining_block_visits($idx);
+	}
+	for my $region (@{$state{regions}}) {
+		my $block = $state{bounds}[$region->{block_idx}] or next;
+		my $block_key = block_key($block);
+		my $available = 0;
+		for my $cell (@{$region->{target_cells} || []}) {
+			my ($cell_x, $cell_y) = unpack_region_target($cell);
+			my $key = "$cell_x,$cell_y";
+			$available++ unless $state{used_targets_by_block}{$block_key}{$key}
+				|| $state{failed_targets_by_block}{$block_key}{$key};
+		}
+		$target_remaining{$region->{id}} = $available;
+	}
+
+	my %full_probability;
+	for my $block_idx (0 .. $#{$state{bounds}}) {
+		my @ids = @{$state{regions_by_block}{$block_idx} || []};
+		my @region_records = map { $state{regions}[$_] } @ids;
+		my $weighted = calculate_region_selection_weights(\@region_records, \%{$state{region_visit_history}});
+		$full_probability{$_->{region_id}} = $_->{probability} for @$weighted;
+	}
+
+	my $remaining_obligations = 0;
+	$remaining_obligations += $_ for values %block_remaining;
+	my $lookahead = $remaining_obligations > 8 ? 7 : $remaining_obligations - 1;
+	$lookahead = 0 if $lookahead < 0;
+	my $plans = build_global_plan_beam(\@{$state{regions}}, \%block_remaining, \%target_remaining,
+		$first_candidates, \%probability, \%full_probability, $lookahead);
+	return undef unless @$plans;
+	my %first_best;
+	for my $plan (@$plans) {
+		$first_best{$plan->{first_id}} = $plan->{score}
+			if !defined($first_best{$plan->{first_id}}) || $plan->{score} < $first_best{$plan->{first_id}};
+	}
+	return undef unless %first_best;
+	my $weighted = calculate_first_region_probabilities(\%first_best, $GLOBAL_PLAN_TEMPERATURE);
+	my %candidate_by_id = map { $_->{region_id} => $_ } @$first_candidates;
+	my %selection_probability = map { $_->{region_id} => $_->{probability} } @$weighted;
+	for my $item (sort { $first_best{$a} <=> $first_best{$b} } keys %first_best) {
+		my $candidate = $candidate_by_id{$item};
+		my $priority_cost = $probability{$item} > 0
+			? -$GLOBAL_PLAN_TEMPERATURE * log($probability{$item}) : 0;
+		my $score = $first_best{$item};
+		my $continuation = $score - ($candidate->{arrival_cost} || 0) - $priority_cost;
+		debug sprintf("[lockMapSweep] Plan first=%d region=%s arrivalCost=%d continuationEstimate=%.1f coveragePriorityCost=%.1f score=%.1f selectionProbability=%.5f lookahead=%d beamWidth=48.\n",
+			$item + 1, $candidate->{region_key}, $candidate->{arrival_cost}, $continuation,
+			$priority_cost, $score, $selection_probability{$item} || 0,
+			$lookahead), 'plugin', 2;
+	}
+	return sample_region_from_weights($weighted);
+}
+
+# Gibbs weighting keeps area/history probability proportional at equal cost;
+# a full detour-window cost difference reduces odds by e^-1 without zeroing them.
+sub calculate_first_region_probabilities {
+	my ($score_by_region, $temperature) = @_;
+	return [] unless ref($score_by_region) eq 'HASH' && %$score_by_region;
+	$temperature = $GLOBAL_PLAN_TEMPERATURE
+		unless defined $temperature && $temperature > 0;
+	my $min_score;
+	for my $score (values %$score_by_region) {
+		$min_score = $score if !defined($min_score) || $score < $min_score;
+	}
+	my @weighted = map {
+		+{ region_id => $_, log_weight => -($score_by_region->{$_} - $min_score) / $temperature }
+	} sort { $a <=> $b } keys %$score_by_region;
+	my $sum = 0;
+	for my $item (@weighted) {
+		$item->{weight} = exp($item->{log_weight});
+		$sum += $item->{weight};
+	}
+	$_->{probability} = $_->{weight} / $sum for @weighted;
+	return \@weighted;
+}
+
+sub build_global_plan_beam {
+	my ($regions, $block_remaining, $target_remaining, $first_candidates,
+		$first_probabilities, $future_probabilities, $depth) = @_;
+	return [] unless ref($regions) eq 'ARRAY' && ref($block_remaining) eq 'HASH'
+		&& ref($target_remaining) eq 'HASH' && ref($first_candidates) eq 'ARRAY'
+		&& ref($first_probabilities) eq 'HASH' && ref($future_probabilities) eq 'HASH';
+	$depth = 4 unless defined $depth && $depth =~ /^\d+$/;
+	my @beam;
+	for my $candidate (@$first_candidates) {
+		my $p = $first_probabilities->{$candidate->{region_id}} || 0;
+		next unless $p > 0;
+		my %remaining = %$block_remaining;
+		$remaining{$candidate->{block_idx}}--;
+		my %available = %$target_remaining;
+		$available{$candidate->{region_id}}--;
+		push @beam, {
+			first_id => $candidate->{region_id},
+			last_id => $candidate->{region_id},
+			remaining => \%remaining,
+			available => \%available,
+			sequence => [$candidate->{region_id}],
+			score => $candidate->{arrival_cost} - $GLOBAL_PLAN_TEMPERATURE * log($p),
+		};
+	}
+	return [] unless @beam;
+	@beam = sort { $a->{score} <=> $b->{score} } @beam;
+	splice(@beam, 48) if @beam > 48;
+
+	# The bounded beam compares future coverage obligations. First-leg costs are
+	# exact movement-rule costs; continuation costs use movement-weighted region
+	# graph distances between representative points. OpenKore still executes and
+	# confirms each destination route independently.
+	for (1 .. $depth) {
+		my @expanded;
+		for my $state (@beam) {
+			my $route_costs = region_graph_costs_from($state->{last_id}, $regions);
+			my @choices;
+			for my $region (@$regions) {
+				my $block_idx = $region->{block_idx};
+				next unless ($state->{remaining}{$block_idx} || 0) > 0;
+				next unless ($state->{available}{$region->{id}} || 0) > 0;
+			next unless defined $route_costs->{$region->{id}};
+				my $p = $future_probabilities->{$region->{id}} || 0;
+				next unless $p > 0;
+				my $travel = $route_costs->{$region->{id}};
+				# A second obligation in one component starts from an unknown target
+				# cell, so retain a conservative service movement estimate.
+				$travel += sqrt($region->{eligible_count} || 1) / 2
+					if $region->{id} == $state->{last_id};
+				push @choices, { region_id => $region->{id}, block_idx => $block_idx,
+					cost => $travel - $GLOBAL_PLAN_TEMPERATURE * log($p) };
+			}
+			@choices = sort { $a->{cost} <=> $b->{cost} } @choices;
+			splice(@choices, 12) if @choices > 12;
+			if (!@choices) {
+				push @expanded, $state;
+				next;
+			}
+			for my $choice (@choices) {
+				my %remaining = %{$state->{remaining}};
+				my %available = %{$state->{available}};
+				$remaining{$choice->{block_idx}}--;
+				$available{$choice->{region_id}}--;
+				push @expanded, {
+					first_id => $state->{first_id},
+					last_id => $choice->{region_id},
+					remaining => \%remaining,
+					available => \%available,
+					sequence => [@{$state->{sequence}}, $choice->{region_id}],
+					score => $state->{score} + $choice->{cost},
+				};
+			}
+		}
+		last unless @expanded;
+		@expanded = sort { $a->{score} <=> $b->{score} } @expanded;
+		my (%kept, @next_beam);
+		for my $item (@expanded) {
+			next if ($kept{$item->{first_id}} || 0) >= 4;
+			$kept{$item->{first_id}}++;
+			push @next_beam, $item;
+			last if @next_beam >= 48;
+		}
+		@beam = @next_beam;
+	}
+	return \@beam;
 }
 
 sub pick_random_walkable_in_block {
@@ -724,11 +2286,16 @@ sub pick_random_walkable_in_block {
 	$state{failed_targets_by_block}{$block_key} ||= {};
 	my $used = $state{used_targets_by_block}{$block_key};
 	my $failed = $state{failed_targets_by_block}{$block_key};
-	my @candidates = grep {
-		my $key = "$_->{x},$_->{y}";
-		!$used->{$key} && !$failed->{$key}
-			&& !($_->{x} == $from->{x} && $_->{y} == $from->{y})
-	} @{$block->{target_cells} || []};
+	my @candidates;
+	for my $y ($block->{min_y} .. $block->{max_y}) {
+		for my $x ($block->{min_x} .. $block->{max_x}) {
+			next unless is_cell_eligible($x, $y);
+			my $key = "$x,$y";
+			next if $used->{$key} || $failed->{$key};
+			next if $x == $from->{x} && $y == $from->{y};
+			push @candidates, { x => $x, y => $y };
+		}
+	}
 	return undef unless @candidates;
 
 	my $must_stay_in_block = $block_idx == $from_block_idx ? 1 : 0;
@@ -815,8 +2382,7 @@ sub complete_empty_block {
 		delete $state{failed_targets_by_block}{block_key($block)};
 	}
 	$state{last_block} = $block_idx;
-	$state{visits_in_block} = 0;
-	$state{current_block} = pick_next_block($block_idx);
+	set_current_block(pick_next_block($block_idx));
 }
 
 sub path_exists_with_allowed_blocks {
@@ -882,13 +2448,7 @@ sub within_block {
 }
 
 sub advance_plan {
-	my $current_block = $state{current_block};
-	$state{visits_in_block}++;
-	my $block = $state{bounds}->[$current_block];
-	my $quota = $block ? scalar(@{$block->{target_cells} || []}) : 0;
-	$quota = $state{cells_per_block} if $quota > $state{cells_per_block};
-	$state{last_block} = $current_block;
-	complete_empty_block($current_block) if !$quota || $state{visits_in_block} >= $quota;
+	start_new_coverage_round() if coverage_round_is_complete();
 }
 
 sub pick_next_block {
@@ -976,8 +2536,22 @@ sub block_grid_to_index {
 
 sub coord_to_block_index {
 	my ($x, $y) = @_;
-	return undef unless defined $x && defined $y;
-	return $state{block_index_lookup}{"$x,$y"};
+	return undef unless is_cell_reachable($x, $y);
+	return block_index_for_cell($x, $y);
+}
+
+sub block_index_for_cell {
+	my ($x, $y) = @_;
+	return undef unless defined $x && defined $y && $state{blocks_x} > 0 && $state{blocks_y} > 0;
+	return undef if $x < $state{walk_min_x} || $x > $state{walk_max_x}
+		|| $y < $state{walk_min_y} || $y > $state{walk_max_y};
+	my $walk_width = $state{walk_max_x} - $state{walk_min_x} + 1;
+	my $walk_height = $state{walk_max_y} - $state{walk_min_y} + 1;
+	return undef if $walk_width <= 0 || $walk_height <= 0;
+	my $bx = int((($x - $state{walk_min_x} + 1) * $state{blocks_x} - 1) / $walk_width);
+	my $by = int((($y - $state{walk_min_y} + 1) * $state{blocks_y} - 1) / $walk_height);
+	return undef if $bx < 0 || $bx >= $state{blocks_x} || $by < 0 || $by >= $state{blocks_y};
+	return block_grid_to_index($bx, $by);
 }
 
 sub neighbor_connection_score {
@@ -1017,16 +2591,26 @@ sub on_command_lock_map_sweep {
 	$command = defined $command && $command ne '' ? lc($command) : 'status';
 
 	if ($command eq 'status') {
+		message "[lockMapSweep] Status command received.\n", 'plugin';
 		my $visited_blocks = scalar keys %{$state{visited_blocks_in_cycle}};
-		message sprintf("[lockMapSweep] ready=%d map=%s block=%d/%d visit=%d/%d visitedBlocks=%d\n",
+		my $remaining_visits = 0;
+		$remaining_visits += remaining_block_visits($_) for 0 .. $#{$state{bounds}};
+		my $pending = $state{pending_target}
+			? "$state{pending_target}{x},$state{pending_target}{y}"
+			: 'none';
+		message sprintf("[lockMapSweep] ready=%d map=%s round=%d block=%d/%d visit=%d/%d visitedBlocks=%d remainingVisits=%d deferredBlocks=%d\n",
 			$state{ready} ? 1 : 0,
 			($state{last_lock_map} || '-'),
+			$state{round_number} || 0,
 			$state{current_block} + 1,
 			($state{block_count} || 0),
 			$state{visits_in_block},
 			($state{cells_per_block} || 0),
-			$visited_blocks
+			$visited_blocks,
+			$remaining_visits,
+			scalar keys %{$state{deferred_blocks}}
 		), 'info';
+		message "[lockMapSweep] pending=$pending\n", 'info';
 		return;
 	}
 
@@ -1061,24 +2645,35 @@ sub build_state_file_path {
 	my $safe_map = $map;
 	$safe_map =~ s/[^A-Za-z0-9_\-\@]/_/g;
 	my $cells = positive_int_or_default($config{lockMapSweep_cellsPerBlock}, 3);
-	return File::Spec->catfile($dir, $safe_map . "_${bx}x${by}_c${cells}_v4.state");
+	return File::Spec->catfile($dir, $safe_map . "_${bx}x${by}_c${cells}_v6.state");
 }
 
 sub load_state_from_file {
 	return 0 unless should_use_state_file();
 	return 0 unless $state{state_file};
-	return 0 unless -f $state{state_file};
 
-	open my $fh, '<', $state{state_file} or return 0;
+	my $source_file = $state{state_file};
+	unless (-f $source_file) {
+		(my $legacy = $source_file) =~ s/_v6\.state$/_v5.state/;
+		return 0 unless -f $legacy;
+		$source_file = $legacy;
+	}
+	return 0 unless -f $source_file;
+	open my $fh, '<', $source_file or return 0;
 	my @lines = <$fh>;
 	close $fh;
 
-	my (%meta, %bounds, %visited_blocks, %used_targets, %failed_targets, $pending);
+	my (%meta, %bounds, %visited_blocks, %used_targets, %failed_targets, %failed_target_retry,
+		%round_visits, %region_visits, %deferred, $pending, $recovery, $retry_metadata_invalid);
 	for my $line (@lines) {
 		chomp $line;
 		next if $line =~ /^\s*$/;
 		if ($line =~ /^meta\t([^\t]+)\t(.*)$/) {
-			return 0 if exists $meta{$1};
+			if (exists $meta{$1}) {
+				return 0 unless $1 eq 'failed_retry_after';
+				$retry_metadata_invalid = 1;
+				next;
+			}
 			$meta{$1} = $2;
 		} elsif ($line =~ /^block\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)$/) {
 			return 0 if exists $bounds{$1};
@@ -1086,21 +2681,88 @@ sub load_state_from_file {
 		} elsif ($line =~ /^visited\t(\d+)$/) {
 			return 0 if exists $visited_blocks{$1};
 			$visited_blocks{$1} = 1;
+		} elsif ($line =~ /^round_visit\t(\d+)\t(\d+)$/) {
+			return 0 if exists $round_visits{$1};
+			$round_visits{$1} = int($2);
+		} elsif ($line =~ /^region_visit\t([^\t]+)\t(\d+)$/) {
+			return 0 if exists $region_visits{$1};
+			$region_visits{$1} = int($2);
+		} elsif ($line =~ /^deferred\t(\d+)\t(\d+)\t(\d+)\t([^\t]*)$/) {
+			return 0 if exists $deferred{$1};
+			$deferred{$1} = { remaining => int($2), round => int($3), reason => $4 };
+		} elsif ($line =~ /^recovery\t(stage|return|blocked)\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)\t(-?\d+)\t(-?\d+)\t(\d+)(?:\t(\d+))?$/) {
+			return 0 if $recovery;
+			my $recovery_failures = defined $9 ? int($9) : ($8 ? 1 : 0);
+			return 0 if $recovery_failures > 1_000_000;
+			$recovery = {
+				phase => $1, block_idx => int($2), x => int($3), y => int($4),
+				region_key => $5, stage_x => int($6), stage_y => int($7),
+				retry_after => int($8), consecutive_failures => $recovery_failures,
+			};
 		} elsif ($line =~ /^target\t(\d+)\t(\d+)\t(\d+)$/) {
 			my ($idx, $x, $y) = ($1, $2, $3);
 			return 0 if $used_targets{$idx}{"$x,$y"}++;
 		} elsif ($line =~ /^failed\t(\d+)\t(\d+)\t(\d+)$/) {
 			my ($idx, $x, $y) = ($1, $2, $3);
-			return 0 if $failed_targets{$idx}{"$x,$y"}++;
-		} elsif ($line =~ /^pending\t(\d+)\t(\d+)\t(\d+)$/) {
+			$retry_metadata_invalid = 1 if $failed_targets{$idx}{"$x,$y"}++;
+		} elsif ($line =~ /^failed_retry\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d{1,11})\t([01])$/) {
+			my ($idx, $x, $y, $failures, $retry_after, $transit) = map { int($_) } ($1, $2, $3, $4, $5, $6);
+			if ($failures < 1 || $failures > 1_000_000 || $retry_after > 4_102_444_800
+				|| exists $failed_target_retry{$idx}{"$x,$y"}) {
+				$retry_metadata_invalid = 1;
+			} else {
+				$failed_target_retry{$idx}{"$x,$y"} = {
+					consecutive_failures => $failures, retry_after => $retry_after, transit => $transit,
+				};
+			}
+		} elsif ($line =~ /^(?:failed|failed_retry)\t/) {
+			$retry_metadata_invalid = 1;
+		} elsif ($line =~ /^pending\t(\d+)\t(\d+)\t(\d+)\t([^\t]+)(?:\t([01]))?$/) {
 			return 0 if $pending;
-			$pending = { block_idx => int($1), x => int($2), y => int($3) };
+			$pending = { block_idx => int($1), x => int($2), y => int($3),
+				region_key => $4, transit => defined $5 ? int($5) : 0 };
 		} else {
 			return 0;
 		}
 	}
 
-	return 0 unless $meta{version} && $meta{version} eq '4';
+	return 0 unless $meta{version} && $meta{version} =~ /^(?:5|6)$/;
+	my $legacy_deadline = 0;
+	if (defined $meta{failed_retry_after}) {
+		if ($meta{failed_retry_after} !~ /^\d{1,11}$/
+			|| $meta{failed_retry_after} > 4_102_444_800) {
+			$retry_metadata_invalid = 1;
+		} else {
+			$legacy_deadline = int($meta{failed_retry_after});
+		}
+	}
+	$retry_metadata_invalid = 1 if $legacy_deadline && !keys %failed_targets;
+	$retry_metadata_invalid = 1 if $meta{version} eq '5' && keys %failed_target_retry;
+	if (!keys %failed_target_retry && !$retry_metadata_invalid) {
+		# Older v6 state had a single global deadline. Migrate it to each failed
+		# destination independently; state without a deadline becomes eligible now.
+		for my $idx (keys %failed_targets) {
+			for my $coord (keys %{$failed_targets{$idx}}) {
+				$failed_target_retry{$idx}{$coord} = {
+					consecutive_failures => 1, retry_after => $legacy_deadline, transit => 0,
+				};
+			}
+		}
+	} elsif (!$retry_metadata_invalid) {
+		$retry_metadata_invalid = 1 if $legacy_deadline;
+		for my $idx (keys %failed_targets) {
+			for my $coord (keys %{$failed_targets{$idx}}) {
+				$retry_metadata_invalid = 1 unless exists $failed_target_retry{$idx}{$coord};
+			}
+		}
+	}
+	if ($retry_metadata_invalid) {
+		%failed_targets = ();
+		%failed_target_retry = ();
+		$legacy_deadline = 0;
+	}
+	return 0 if $meta{version} eq '5' && $pending && $pending->{transit};
+	return 0 if $meta{version} eq '5' && $recovery;
 	return 0 unless $meta{map} && $meta{map} eq $state{last_lock_map};
 	return 0 unless defined $meta{width} && $meta{width} == $state{width};
 	return 0 unless defined $meta{height} && $meta{height} == $state{height};
@@ -1110,6 +2772,7 @@ sub load_state_from_file {
 	return 0 unless defined $meta{geometry} && $meta{geometry} eq $state{geometry_signature};
 	return 0 unless defined $meta{current_block} && $meta{current_block} =~ /^\d+$/ && $meta{current_block} < $state{block_count};
 	return 0 unless defined $meta{visits_in_block} && $meta{visits_in_block} =~ /^\d+$/;
+	return 0 unless defined $meta{round_number} && $meta{round_number} =~ /^\d+$/ && $meta{round_number} > 0;
 	return 0 unless defined $meta{walk_min_x} && $meta{walk_min_x} =~ /^\d+$/;
 	return 0 unless defined $meta{walk_max_x} && $meta{walk_max_x} =~ /^\d+$/;
 	return 0 unless defined $meta{walk_min_y} && $meta{walk_min_y} =~ /^\d+$/;
@@ -1136,17 +2799,31 @@ sub load_state_from_file {
 		return 0 unless $saved->{min_x} == $expected_min_x && $saved->{max_x} == $expected_max_x
 			&& $saved->{min_y} == $expected_min_y && $saved->{max_y} == $expected_max_y;
 		return 0 if $saved->{min_x} > $saved->{max_x} || $saved->{min_y} > $saved->{max_y};
-		my @target_cells;
+		my $eligible_count = 0;
 		for my $y ($saved->{min_y} .. $saved->{max_y}) {
 			for my $x ($saved->{min_x} .. $saved->{max_x}) {
-				push @target_cells, { x => $x, y => $y } if is_cell_eligible($x, $y);
+				$eligible_count++ if is_cell_eligible($x, $y);
 			}
 		}
-		return 0 unless @target_cells == $saved->{walkable_count};
-		$restored_bounds[$idx] = { %$saved, target_cells => \@target_cells };
+		return 0 unless $eligible_count == $saved->{walkable_count};
+		$restored_bounds[$idx] = { %$saved };
 	}
 	for my $idx (keys %visited_blocks) {
 		return 0 if $idx >= $state{block_count} || !$restored_bounds[$idx]{walkable_count};
+	}
+	my %valid_region_keys = map { $_->{key} => $_ } @{$state{regions}};
+	for my $key (keys %region_visits) {
+		return 0 unless exists $valid_region_keys{$key} && $region_visits{$key} =~ /^\d+$/;
+	}
+	for my $idx (keys %round_visits) {
+		return 0 if $idx >= $state{block_count};
+		my $eligible = $restored_bounds[$idx]{walkable_count} || 0;
+		my $quota = $eligible < $state{cells_per_block} ? $eligible : $state{cells_per_block};
+		return 0 if $round_visits{$idx} > $quota;
+	}
+	for my $idx (keys %deferred) {
+		return 0 if $idx >= $state{block_count};
+		return 0 if $deferred{$idx}{remaining} <= 0 || $deferred{$idx}{round} != $meta{round_number};
 	}
 	for my $idx (keys %used_targets) {
 		return 0 if $idx >= $state{block_count};
@@ -1156,41 +2833,159 @@ sub load_state_from_file {
 			return 0 unless within_block({ x => $x, y => $y }, $block) && is_cell_eligible($x, $y);
 		}
 	}
+	my $retry_cells_valid = 1;
 	for my $idx (keys %failed_targets) {
-		return 0 if $idx >= $state{block_count};
+		if ($idx >= $state{block_count}) { $retry_cells_valid = 0; last; }
 		my $block = $restored_bounds[$idx];
 		for my $coord (keys %{$failed_targets{$idx}}) {
 			my ($x, $y) = split /,/, $coord;
-			return 0 unless within_block({ x => $x, y => $y }, $block) && is_cell_eligible($x, $y);
+			my $retry = $failed_target_retry{$idx}{$coord};
+			unless ($retry && valid_failed_retry_cell($x, $y, $block, $retry->{transit})) {
+				$retry_cells_valid = 0;
+				last;
+			}
+		}
+		last unless $retry_cells_valid;
+	}
+	for my $idx (keys %failed_target_retry) {
+		if ($idx >= $state{block_count}) { $retry_cells_valid = 0; last; }
+		my $block = $restored_bounds[$idx];
+		for my $coord (keys %{$failed_target_retry{$idx}}) {
+			my ($x, $y) = split /,/, $coord;
+			my $retry = $failed_target_retry{$idx}{$coord};
+			unless (valid_failed_retry_cell($x, $y, $block, $retry->{transit})
+				&& ($retry->{retry_after} <= time()
+					|| exists $failed_targets{$idx}{$coord})) {
+				$retry_cells_valid = 0;
+				last;
+			}
+		}
+		last unless $retry_cells_valid;
+	}
+	unless ($retry_cells_valid) {
+		%failed_targets = ();
+		%failed_target_retry = ();
+		$retry_metadata_invalid = 1;
+	}
+	if ($recovery) {
+		if ($retry_metadata_invalid && $recovery->{phase} eq 'return') {
+			$recovery->{retry_after} = 0;
+			$recovery->{consecutive_failures} = 0;
+		}
+		return 0 if $recovery->{block_idx} >= $state{block_count};
+		my $target_block = $restored_bounds[$recovery->{block_idx}];
+		return 0 unless within_block({ x => $recovery->{x}, y => $recovery->{y} }, $target_block)
+			&& is_cell_eligible($recovery->{x}, $recovery->{y});
+		my $target_region_id = region_id_at($recovery->{x}, $recovery->{y});
+		return 0 unless defined $target_region_id
+			&& $state{regions}[$target_region_id]{key} eq $recovery->{region_key}
+			&& $state{regions}[$target_region_id]{block_idx} == $recovery->{block_idx};
+		my $target_quota = $target_block->{walkable_count} || 0;
+		$target_quota = $state{cells_per_block} if $target_quota > $state{cells_per_block};
+		return 0 if ($round_visits{$recovery->{block_idx}} || 0) >= $target_quota;
+		return 0 if $used_targets{$recovery->{block_idx}}{"$recovery->{x},$recovery->{y}"};
+		if ($recovery->{phase} eq 'blocked') {
+			return 0 unless $recovery->{retry_after} > 0
+				&& $recovery->{retry_after} <= 4_102_444_800;
+			return 0 if $pending;
+			my $defer = $deferred{$recovery->{block_idx}} or return 0;
+			return 0 unless $defer->{reason} =~ /occupied-only|staging route failed/;
+			if ($recovery->{stage_x} == -1 && $recovery->{stage_y} == -1) {
+				# No reachable staging cell was found; the pair is intentionally empty.
+			} else {
+				return 0 if $recovery->{stage_x} < 0 || $recovery->{stage_y} < 0
+					|| $recovery->{stage_x} >= $state{width} || $recovery->{stage_y} >= $state{height};
+				return 0 if $recovery->{stage_x} == $recovery->{x}
+					&& $recovery->{stage_y} == $recovery->{y};
+				return 0 unless $field->isWalkable($recovery->{stage_x}, $recovery->{stage_y})
+					&& defined region_id_at($recovery->{stage_x}, $recovery->{stage_y});
+			}
+		} else {
+			return 0 if $recovery->{phase} eq 'stage' && $recovery->{retry_after} != 0;
+			return 0 if $recovery->{stage_x} < 0 || $recovery->{stage_y} < 0
+				|| $recovery->{stage_x} >= $state{width} || $recovery->{stage_y} >= $state{height};
+			return 0 if $recovery->{stage_x} == $recovery->{x}
+				&& $recovery->{stage_y} == $recovery->{y};
+			return 0 unless $field->isWalkable($recovery->{stage_x}, $recovery->{stage_y});
+			my $stage_region_id = region_id_at($recovery->{stage_x}, $recovery->{stage_y});
+			return 0 unless defined $stage_region_id;
+			my $stage_region_key = $state{regions}[$stage_region_id]{key};
+			my $stage_block_idx = $state{regions}[$stage_region_id]{block_idx};
+			if ($recovery->{phase} eq 'stage') {
+				if ($pending) {
+					return 0 unless $pending->{transit}
+						&& $pending->{x} == $recovery->{stage_x}
+						&& $pending->{y} == $recovery->{stage_y}
+						&& $pending->{region_key} eq $stage_region_key
+						&& $pending->{block_idx} == $stage_block_idx;
+					return 0 unless $pending->{block_idx} == $meta{current_block};
+				} else {
+					# A live config change can cancel the owned staging route. Keep
+					# this validated waypoint as an interrupted recovery phase so
+					# the next enabled randomWalk tick can safely queue it again.
+					return 0 unless $stage_block_idx == $meta{current_block};
+				}
+			} else {
+				return 0 if $pending && $recovery->{retry_after} > 0;
+				if ($recovery->{retry_after} > 0) {
+					my $retry = $failed_target_retry{$recovery->{block_idx}}{"$recovery->{x},$recovery->{y}"}
+						or return 0;
+					return 0 unless $retry->{retry_after} == $recovery->{retry_after}
+						&& $retry->{consecutive_failures} == $recovery->{consecutive_failures};
+				}
+				return 0 if $pending && ($pending->{transit}
+					|| $pending->{x} != $recovery->{x} || $pending->{y} != $recovery->{y}
+					|| $pending->{block_idx} != $recovery->{block_idx}
+					|| $pending->{region_key} ne $recovery->{region_key});
+			}
 		}
 	}
 	if ($pending) {
 		return 0 if $pending->{block_idx} >= $state{block_count};
 		my $pending_block = $restored_bounds[$pending->{block_idx}];
 		return 0 unless $pending->{block_idx} == $meta{current_block};
+		my $is_staging = $recovery && $recovery->{phase} eq 'stage'
+			&& $pending->{transit} && $pending->{x} == $recovery->{stage_x}
+			&& $pending->{y} == $recovery->{stage_y};
 		return 0 unless within_block({ x => $pending->{x}, y => $pending->{y} }, $pending_block)
-			&& is_cell_eligible($pending->{x}, $pending->{y});
+			&& ($is_staging
+				? $field->isWalkable($pending->{x}, $pending->{y})
+				: is_cell_eligible($pending->{x}, $pending->{y}));
+		my $region_id = region_id_at($pending->{x}, $pending->{y});
+		return 0 unless defined $region_id && $state{regions}[$region_id]{key} eq $pending->{region_key};
+		return 0 unless $state{regions}[$region_id]{block_idx} == $pending->{block_idx};
 	}
+	my $current_visits = $round_visits{$meta{current_block}} || 0;
+	return 0 unless $meta{visits_in_block} == $current_visits;
 	my $block = $restored_bounds[$meta{current_block}];
-	my $quota = scalar @{$block->{target_cells}};
+	my $quota = $block->{walkable_count} || 0;
 	$quota = $state{cells_per_block} if $quota > $state{cells_per_block};
-	return 0 if $meta{visits_in_block} >= $quota;
+	return 0 if $current_visits > $quota;
 
-	$state{current_block} = int($meta{current_block});
-	$state{visits_in_block} = int($meta{visits_in_block});
+	$state{block_visit_counts} = \%round_visits;
+	set_current_block(int($meta{current_block}));
 	$state{bounds} = \@restored_bounds;
 	$state{walk_min_x} = int($meta{walk_min_x});
 	$state{walk_max_x} = int($meta{walk_max_x});
 	$state{walk_min_y} = int($meta{walk_min_y});
 	$state{walk_max_y} = int($meta{walk_max_y});
 	$state{visited_blocks_in_cycle} = \%visited_blocks;
+	$state{round_number} = int($meta{round_number});
+	$state{failed_retry_after} = 0; # legacy metadata is migrated into per-target entries below
+	$state{region_visit_history} = \%region_visits;
+	$state{deferred_blocks} = \%deferred;
+	$state{same_cell_recovery} = $recovery;
 	$state{used_targets_by_block} = {};
 	$state{failed_targets_by_block} = {};
+	$state{failed_target_retry_by_block} = {};
 	for my $idx (keys %used_targets) {
 		$state{used_targets_by_block}{block_key($restored_bounds[$idx])} = $used_targets{$idx};
 	}
 	for my $idx (keys %failed_targets) {
 		$state{failed_targets_by_block}{block_key($restored_bounds[$idx])} = $failed_targets{$idx};
+	}
+	for my $idx (keys %failed_target_retry) {
+		$state{failed_target_retry_by_block}{block_key($restored_bounds[$idx])} = $failed_target_retry{$idx};
 	}
 	$state{pending_target} = $pending;
 
@@ -1202,6 +2997,7 @@ sub persist_state {
 	return 0 unless $state{state_file};
 
 	return 0 unless $state{ready};
+	return 0 unless set_current_block($state{current_block});
 	my (undef, $dir) = File::Spec->splitpath($state{state_file});
 	$dir ||= '.';
 	eval { make_path($dir) unless -d $dir; 1 } or do {
@@ -1219,7 +3015,7 @@ sub persist_state {
 		return 0;
 	}
 	my $ok = eval {
-		print {$fh} "meta\tversion\t4\n";
+		print {$fh} "meta\tversion\t6\n";
 		print {$fh} "meta\tmap\t$state{last_lock_map}\n";
 		print {$fh} "meta\twidth\t$state{width}\n";
 		print {$fh} "meta\theight\t$state{height}\n";
@@ -1229,6 +3025,9 @@ sub persist_state {
 		print {$fh} "meta\tgeometry\t$state{geometry_signature}\n";
 		print {$fh} "meta\tcurrent_block\t$state{current_block}\n";
 		print {$fh} "meta\tvisits_in_block\t$state{visits_in_block}\n";
+		# Kept at zero for backward compatibility; current retry state is per target.
+		print {$fh} "meta\tfailed_retry_after\t0\n";
+		print {$fh} "meta\tround_number\t$state{round_number}\n";
 		print {$fh} "meta\twalk_min_x\t$state{walk_min_x}\n";
 		print {$fh} "meta\twalk_max_x\t$state{walk_max_x}\n";
 		print {$fh} "meta\twalk_min_y\t$state{walk_min_y}\n";
@@ -1243,9 +3042,34 @@ sub persist_state {
 				my ($x, $y) = split /,/, $coord;
 				print {$fh} "failed\t$idx\t$x\t$y\n";
 			}
+			for my $coord (sort keys %{$state{failed_target_retry_by_block}{$key} || {}}) {
+				my ($x, $y) = split /,/, $coord;
+				my $retry = $state{failed_target_retry_by_block}{$key}{$coord};
+				print {$fh} join("\t", 'failed_retry', $idx, $x, $y,
+					$retry->{consecutive_failures}, $retry->{retry_after}, $retry->{transit} ? 1 : 0) . "\n";
+			}
+		}
+		for my $idx (sort { $a <=> $b } keys %{$state{block_visit_counts}}) {
+			print {$fh} "round_visit\t$idx\t$state{block_visit_counts}{$idx}\n";
+		}
+		for my $key (sort keys %{$state{region_visit_history}}) {
+			print {$fh} "region_visit\t$key\t$state{region_visit_history}{$key}\n";
+		}
+		for my $idx (sort { $a <=> $b } keys %{$state{deferred_blocks}}) {
+			my $deferred = $state{deferred_blocks}{$idx};
+			my $reason = $deferred->{reason} || '';
+			$reason =~ s/[\t\r\n]/ /g;
+			print {$fh} "deferred\t$idx\t$deferred->{remaining}\t$deferred->{round}\t$reason\n";
+		}
+		if (my $recovery = $state{same_cell_recovery}) {
+			print {$fh} join("\t", 'recovery', $recovery->{phase}, $recovery->{block_idx},
+				$recovery->{x}, $recovery->{y}, $recovery->{region_key},
+				$recovery->{stage_x}, $recovery->{stage_y}, $recovery->{retry_after} || 0,
+				$recovery->{consecutive_failures} || 0) . "\n";
 		}
 		if (my $pending = $state{pending_target}) {
-			print {$fh} "pending\t$pending->{block_idx}\t$pending->{x}\t$pending->{y}\n";
+			my $transit_flag = $pending->{transit} ? "\t1" : '';
+			print {$fh} "pending\t$pending->{block_idx}\t$pending->{x}\t$pending->{y}\t$pending->{region_key}$transit_flag\n";
 		}
 		for my $idx (sort { $a <=> $b } keys %{$state{visited_blocks_in_cycle}}) {
 			print {$fh} "visited\t$idx\n";
